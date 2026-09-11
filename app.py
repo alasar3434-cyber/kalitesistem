@@ -2,14 +2,13 @@ import streamlit as st
 import pandas as pd
 import datetime
 import os
-import json
-import shutil
 import re
 import zipfile
 import io
-import hashlib
 import gspread
 from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
 
 # --- 1. ÇALIŞMA DİZİNİ GÜVENLİK KİLİDİ ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -18,25 +17,32 @@ os.chdir(BASE_DIR)
 # --- SAYFA AYARLARI ---
 st.set_page_config(page_title="ALASAR GRUP - Kalite Yönetim Sistemi", page_icon="🛡️", layout="wide")
 
-# --- HASH YARDIMCI FONKSİYONU ---
-def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode('utf-8')).hexdigest()
-
-# --- GOOGLE SHEETS ENTEGRASYONU ---
+# --- GOOGLE SHEETS & DRIVE ENTEGRASYONU ---
 SPREADSHEET_ID = "1sepPuuUSmJg3g2Yw-ZXjMLtmut2DiatH4sLqJFDiano"
+DRIVE_FOLDER_ID = "1hU-W47HVtFHb-if_BMEbw17He3b8mak9"  # App_Dokumanlar Klasör ID
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
+
+@st.cache_resource
+def get_gcp_credentials():
+    if "gcp_service_account" in st.secrets:
+        creds_dict = dict(st.secrets["gcp_service_account"])
+        return Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+    else:
+        return Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
 
 @st.cache_resource
 def get_gspread_client():
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
-    ]
-    if "gcp_service_account" in st.secrets:
-        creds_dict = dict(st.secrets["gcp_service_account"])
-        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-    else:
-        creds = Credentials.from_service_account_file("credentials.json", scopes=scopes)
+    creds = get_gcp_credentials()
     return gspread.authorize(creds)
+
+@st.cache_resource
+def get_drive_service():
+    creds = get_gcp_credentials()
+    return build('drive', 'v3', credentials=creds)
 
 def get_worksheet_by_name(sheet_name):
     client = get_gspread_client()
@@ -45,9 +51,11 @@ def get_worksheet_by_name(sheet_name):
         return sh.worksheet(sheet_name)
     except Exception:
         if sheet_name == "Departman_Dokumanlari":
-            cols = ["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Drive İndirme / Görme Linki", "Ekleyen", "Revizyon Mu"]
+            cols = ["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Drive Linki", "Ekleyen", "Revizyon Mu"]
         elif sheet_name == "Arsiv_Dokumanlari":
-            cols = ["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Drive İndirme / Görme Linki", "Ekleyen", "Arşivlenme Tarihi"]
+            cols = ["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Drive Linki", "Ekleyen", "Arşivlenme Tarihi"]
+        elif sheet_name == "kullanicilar":
+            cols = ["KullaniciAdi", "Sifre", "AdSoyad", "Rol", "Departman", "Durum", "Yetki"]
         else:
             cols = ["Tarih / Saat", "İşlemi Yapan", "Departman / Modül", "Detay / Doküman"]
         
@@ -63,26 +71,21 @@ def load_data(sheet_name):
         
         if df.empty:
             if sheet_name == "Departman_Dokumanlari":
-                return pd.DataFrame(columns=["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Drive İndirme / Görme Linki", "Ekleyen", "Revizyon Mu"])
+                return pd.DataFrame(columns=["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Drive Linki", "Ekleyen", "Revizyon Mu"])
             elif sheet_name == "Arsiv_Dokumanlari":
-                return pd.DataFrame(columns=["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Drive İndirme / Görme Linki", "Ekleyen", "Arşivlenme Tarihi"])
+                return pd.DataFrame(columns=["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Drive Linki", "Ekleyen", "Arşivlenme Tarihi"])
+            elif sheet_name == "kullanicilar":
+                return pd.DataFrame(columns=["KullaniciAdi", "Sifre", "AdSoyad", "Rol", "Departman", "Durum", "Yetki"])
             else:
                 return pd.DataFrame(columns=["Tarih / Saat", "İşlemi Yapan", "Departman / Modül", "Detay / Doküman"])
 
         if sheet_name == "Departman_Dokumanlari":
-            expected_cols = ["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Drive İndirme / Görme Linki", "Ekleyen", "Revizyon Mu"]
+            expected_cols = ["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Drive Linki", "Ekleyen", "Revizyon Mu"]
             for col in expected_cols:
                 if col not in df.columns:
-                    if col == "Revizyon Mu":
-                        df[col] = "Hayır"
-                    elif col == "Revizyon No":
-                        df[col] = "00"
-                    elif col == "Drive İndirme / Görme Linki":
-                        df[col] = "-"
-                    else:
-                        df[col] = "-"
+                    df[col] = "Hayır" if col == "Revizyon Mu" else ("-" if col == "Drive Linki" else ("00" if col == "Revizyon No" else "-"))
         elif sheet_name == "Arsiv_Dokumanlari":
-            expected_cols = ["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Drive İndirme / Görme Linki", "Ekleyen", "Arşivlenme Tarihi"]
+            expected_cols = ["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Drive Linki", "Ekleyen", "Arşivlenme Tarihi"]
             for col in expected_cols:
                 if col not in df.columns:
                     df[col] = "-"
@@ -101,8 +104,22 @@ def save_data(df_new, sheet_name):
     except Exception as e:
         st.error(f"Google Sheets kaydetme hatası ({sheet_name}): {e}")
 
+# --- GOOGLE DRIVE DOSYA YÜKLEME FONKSİYONU ---
+def upload_to_google_drive(file_bytes, filename, mime_type="application/octet-stream"):
+    try:
+        service = get_drive_service()
+        file_metadata = {
+            'name': filename,
+            'parents': [DRIVE_FOLDER_ID]
+        }
+        media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=mime_type, resumable=True)
+        file = service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
+        return file.get('webViewLink', '-')
+    except Exception as e:
+        st.error(f"Google Drive'a yüklenirken hata oluştu: {e}")
+        return "-"
+
 # --- DOSYA VE KLASÖR YOLLARI ---
-USERS_FILE = os.path.join(BASE_DIR, "users.json")
 UPLOAD_DIR = os.path.join(BASE_DIR, "yuklenen_belgeler")
 ARCHIVE_DIR = os.path.join(BASE_DIR, "arsivlenenler")
 
@@ -155,31 +172,6 @@ def create_system_zip():
     zip_buffer.seek(0)
     return zip_buffer
 
-# --- VARSAYILAN KULLANICI LİSTESİ (HASH'LENMİŞ) ---
-DEFAULT_USERS = {
-    "Mehmet Alaşar": {"password": hash_password("malsr3434."), "role": "Yönetici", "can_edit": False},
-    "Dilber Alaşar": {"password": hash_password("dalsr4141."), "role": "Yönetici", "can_edit": True},
-    "Nilay Kiraz": {"password": hash_password("nkrz5151."), "role": "İK", "can_edit": False},
-    "Ömer OCAK": {"password": hash_password("oock6161."), "role": "Kalite Sistem Mühendisi", "can_edit": True}
-}
-
-def load_users():
-    if os.path.exists(USERS_FILE):
-        try:
-            with open(USERS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return DEFAULT_USERS
-    else:
-        save_users(DEFAULT_USERS)
-        return DEFAULT_USERS
-
-def save_users(users_dict):
-    with open(USERS_FILE, "w", encoding="utf-8") as f:
-        json.dump(users_dict, f, ensure_ascii=False, indent=4)
-
-USERS = load_users()
-
 def add_notification(user, modul, detail):
     df_notif = load_data("Bildirimler")
     now_str = datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
@@ -192,47 +184,79 @@ def add_notification(user, modul, detail):
     df_notif = pd.concat([pd.DataFrame([new_notif]), df_notif], ignore_index=True)
     save_data(df_notif, "Bildirimler")
 
+# --- CANLI KULLANICI DOĞRULAMA KONTROLÜ ---
+def authenticate_user_live(username_input, password_input):
+    df_users = load_data("kullanicilar")
+    if df_users.empty:
+        return False, "Kullanıcı veritabanına ulaşılamadı.", None
+
+    user_row = df_users[df_users["KullaniciAdi"].astype(str).str.strip() == str(username_input).strip()]
+    if user_row.empty:
+        return False, "Kullanıcı adı bulunamadı.", None
+    
+    u_data = user_row.iloc[0].to_dict()
+    
+    if str(u_data.get("Durum", "")).strip().lower() != "aktif":
+        return False, "Hesabınız pasif durumdadır. Yöneticinizle iletişime geçiniz.", None
+        
+    if str(u_data.get("Sifre", "")).strip() != str(password_input).strip():
+        return False, "Hatalı şifre girdiniz.", None
+        
+    return True, "Başarılı", u_data
+
 # --- OTURUM DURUMU ---
 if "logged_in" not in st.session_state:
     st.session_state["logged_in"] = False
 if "username" not in st.session_state:
     st.session_state["username"] = ""
+if "full_name" not in st.session_state:
+    st.session_state["full_name"] = ""
 if "role" not in st.session_state:
     st.session_state["role"] = ""
+if "dept" not in st.session_state:
+    st.session_state["dept"] = ""
 if "can_edit" not in st.session_state:
     st.session_state["can_edit"] = False
 
 # --- GİRİŞ EKRANI (LOGIN) ---
 if not st.session_state["logged_in"]:
     st.title("🏢 ALASAR GRUP")
-    st.subheader("Kalite & Departman Yönetim Sistemi - Giriş Paneli")
+    st.subheader("Kalite & Departman Yönetim Sistemi - Canlı Giriş Paneli")
     
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
         with st.form("login_form"):
-            selected_user = st.selectbox("Kullanıcı Seçiniz", list(USERS.keys()))
+            input_user = st.text_input("Kullanıcı Adı")
             input_password = st.text_input("Şifre", type="password")
-            submit_login = st.form_submit_button("🔑 Giriş Yap")
+            submit_login = st.form_submit_button("🔑 Giriş Yap", use_container_width=True)
             
             if submit_login:
-                hashed_input = hash_password(input_password)
-                if hashed_input == USERS[selected_user]["password"]:
-                    st.session_state["logged_in"] = True
-                    st.session_state["username"] = selected_user
-                    st.session_state["role"] = USERS[selected_user]["role"]
-                    st.session_state["can_edit"] = USERS[selected_user]["can_edit"]
-                    st.success(f"Hoş geldiniz, {selected_user}!")
-                    st.rerun()
+                if not input_user or not input_password:
+                    st.warning("Lütfen kullanıcı adı ve şifrenizi giriniz.")
                 else:
-                    st.error("Hatalı şifre! Lütfen tekrar deneyiniz.")
+                    success, msg, u_data = authenticate_user_live(input_user, input_password)
+                    if success:
+                        st.session_state["logged_in"] = True
+                        st.session_state["username"] = u_data.get("KullaniciAdi", input_user)
+                        st.session_state["full_name"] = u_data.get("AdSoyad", input_user)
+                        st.session_state["role"] = u_data.get("Rol", "-")
+                        st.session_state["dept"] = u_data.get("Departman", "-")
+                        
+                        perm_str = str(u_data.get("Yetki", "")).strip().upper()
+                        st.session_state["can_edit"] = (perm_str == "DÜZENLEME")
+                        
+                        st.success(f"Hoş geldiniz, {st.session_state['full_name']}!")
+                        st.rerun()
+                    else:
+                        st.error(msg)
     st.stop()
 
 # --- ANA SİSTEM SOL MENÜ ---
 st.sidebar.title("🏢 ALASAR GRUP")
-st.sidebar.write(f"👤 **{st.session_state['username']}**")
-st.sidebar.caption(f"Rol: {st.session_state['role']}")
+st.sidebar.write(f"👤 **{st.session_state['full_name']}**")
+st.sidebar.caption(f"Rol: {st.session_state['role']} | Dep: {st.session_state['dept']}")
 
-if st.session_state["username"] == "Ömer OCAK":
+if st.session_state["username"] == "omer.ocak" or "ÖMER" in st.session_state["full_name"].upper():
     st.sidebar.info("⚡ Superadmin / Tam Sistem Yetkilisi")
 elif st.session_state["can_edit"]:
     st.sidebar.success("✏️ Doküman Yükleme / Revize Yetkisi Var")
@@ -242,13 +266,15 @@ else:
 if st.sidebar.button("🚪 Çıkış Yap"):
     st.session_state["logged_in"] = False
     st.session_state["username"] = ""
+    st.session_state["full_name"] = ""
     st.session_state["role"] = ""
+    st.session_state["dept"] = ""
     st.session_state["can_edit"] = False
     st.rerun()
 
 st.sidebar.markdown("---")
 st.sidebar.markdown(f"📊 **Canlı VT:** [Google Sheets Tablosu](https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID})")
-st.sidebar.markdown("📁 **Ortak Arşiv:** [Google Drive Klasörü](https://drive.google.com/drive/my-drive)")
+st.sidebar.markdown(f"📁 **Google Drive:** [App_Dokumanlar Klasörü](https://drive.google.com/drive/u/0/folders/{DRIVE_FOLDER_ID})")
 st.sidebar.markdown("---")
 
 menu_options = [
@@ -262,32 +288,11 @@ menu_options = [
     "🔔 Bildirim Geçmişi"
 ]
 
-if st.session_state["username"] == "Ömer OCAK":
+if st.session_state["username"] == "omer.ocak" or "ÖMER" in st.session_state["full_name"].upper():
     menu_options.append("⚙️ SİSTEM YÖNETİMİ & BAKIŞ")
 
 modul = st.sidebar.radio("DEPARTMANLAR VE MENÜ:", menu_options)
 st.sidebar.markdown("---")
-
-# --- KULLANICI ŞİFRE DEĞİŞTİRME ALANI ---
-with st.sidebar.expander("🔑 Şifremi Değiştir"):
-    with st.form("change_password_form", clear_on_submit=True):
-        old_pass = st.text_input("Mevcut Şifre", type="password")
-        new_pass = st.text_input("Yeni Şifre", type="password")
-        new_pass_confirm = st.text_input("Yeni Şifre (Tekrar)", type="password")
-        btn_pass = st.form_submit_button("Güncelle")
-        
-        if btn_pass:
-            current_user = st.session_state["username"]
-            if hash_password(old_pass) != USERS[current_user]["password"]:
-                st.error("Mevcut şifreniz hatalı!")
-            elif new_pass != new_pass_confirm:
-                st.error("Yeni şifreler eşleşmiyor!")
-            elif len(new_pass) < 4:
-                st.error("Şifre en az 4 karakter olmalıdır!")
-            else:
-                USERS[current_user]["password"] = hash_password(new_pass)
-                save_users(USERS)
-                st.success("Şifreniz başarıyla değiştirildi!")
 
 # --- CANLI BİLDİRİM PANELİ ---
 df_notif_top = load_data("Bildirimler")
@@ -329,18 +334,17 @@ if modul == "🔍 GENEL ARAMA MERKEZİ":
 
             for idx, row in filtered_df.iterrows():
                 f_name = row.get("Dosya Adı", "Yok")
-                d_link = str(row.get("Drive İndirme / Görme Linki", "-")).strip()
-                
+                d_link = row.get("Drive Linki", "-")
                 c1, c2 = st.columns([3, 1])
                 c1.write(f"📄 **[{row.get('Departman')}]** - **[{row.get('Doküman No')}]** {row.get('Doküman Adı')} *(Rev: {row.get('Revizyon No')})*")
                 
                 if d_link and d_link != "-":
-                    c2.markdown(f"[📥 Drive'dan İndir / Gör]({d_link})")
+                    c2.markdown(f"[📥 Google Drive'da Aç / İndir]({d_link})")
                 elif f_name and f_name != "Yok":
                     f_path = os.path.join(UPLOAD_DIR, f_name)
                     if os.path.exists(f_path):
                         with open(f_path, "rb") as f:
-                            c2.download_button(label="📥 İndir", data=f, file_name=f_name, key=f"glob_act_{idx}_{f_name}")
+                            c2.download_button(label="📥 İndir (Yerel)", data=f, file_name=f_name, key=f"glob_act_{idx}_{f_name}")
         else:
             st.info("Sistemde henüz aktif doküman bulunmuyor.")
 
@@ -362,13 +366,12 @@ if modul == "🔍 GENEL ARAMA MERKEZİ":
 
             for idx, row in filtered_arch.iterrows():
                 f_name = row.get("Dosya Adı", "Yok")
-                d_link = str(row.get("Drive İndirme / Görme Linki", "-")).strip()
-                
+                d_link = row.get("Drive Linki", "-")
                 c1, c2 = st.columns([3, 1])
                 c1.write(f"📁 **[{row.get('Departman')}]** - **[{row.get('Doküman No')}]** {row.get('Doküman Adı')} *(Rev: {row.get('Revizyon No')})* - Arşiv: {row.get('Arşivlenme Tarihi')}")
                 
                 if d_link and d_link != "-":
-                    c2.markdown(f"[📥 Drive Eski Versiyon Gör/İndir]({d_link})")
+                    c2.markdown(f"[📥 Drive Arşiv Linki]({d_link})")
                 elif f_name and f_name != "Yok":
                     f_path = os.path.join(ARCHIVE_DIR, f_name)
                     if os.path.exists(f_path):
@@ -380,7 +383,7 @@ if modul == "🔍 GENEL ARAMA MERKEZİ":
 # --- SİSTEM YÖNETİMİ & TEMİZLEME MODÜLÜ ---
 elif modul == "⚙️ SİSTEM YÖNETİMİ & BAKIŞ":
     st.title("⚙️ Sistem Yönetimi ve Toplu İşlem Paneli")
-    st.warning("⚠️ Bu panel sadece **Ömer OCAK** tarafından görüntülenebilir ve yetkilendirilmiştir.")
+    st.warning("⚠️ Bu panel sadece **Sistem Yöneticisi** tarafından görüntülenebilir ve yetkilendirilmiştir.")
 
     st.markdown("### 📦 1. Tüm Belgeleri Toplu İndir (ZIP)")
     st.write("Sistemde yuklenen tüm aktif ve arşivlenmiş dokümanları tek bir arşiv dosyası (.zip) olarak indirebilirsiniz.")
@@ -413,11 +416,11 @@ elif modul == "⚙️ SİSTEM YÖNETİMİ & BAKIŞ":
                     except Exception as e:
                         st.error(f"Dosya silinirken hata oluştu: {file_path} - {e}")
         
-        save_data(pd.DataFrame(columns=["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Drive İndirme / Görme Linki", "Ekleyen", "Revizyon Mu"]), "Departman_Dokumanlari")
-        save_data(pd.DataFrame(columns=["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Drive İndirme / Görme Linki", "Ekleyen", "Arşivlenme Tarihi"]), "Arsiv_Dokumanlari")
+        save_data(pd.DataFrame(columns=["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Drive Linki", "Ekleyen", "Revizyon Mu"]), "Departman_Dokumanlari")
+        save_data(pd.DataFrame(columns=["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Drive Linki", "Ekleyen", "Arşivlenme Tarihi"]), "Arsiv_Dokumanlari")
         save_data(pd.DataFrame(columns=["Tarih / Saat", "İşlemi Yapan", "Departman / Modül", "Detay / Doküman"]), "Bildirimler")
 
-        add_notification("Ömer OCAK", "Sistem Yönetimi", "Tüm sistem belgeleri ve veri tabanı kayıtları sıfırlandı.")
+        add_notification(st.session_state["full_name"], "Sistem Yönetimi", "Tüm sistem belgeleri ve veri tabanı kayıtları sıfırlandı.")
         st.success("✅ Tüm sistem belgeleri ve Google Sheets veri tabanı başarıyla temizlendi!")
         st.rerun()
 
@@ -441,11 +444,7 @@ else:
     if st.session_state["can_edit"]:
         st.subheader(f"📤 {dept_name} İçin Doküman Yükleme Paneli")
         
-        upload_mode = st.radio("Yükleme Modunu Seçiniz:", [
-            "📄 Tekli Doküman Yükleme / Revize Etme", 
-            "📁 Toplu Çoklu Dosya Yükleme",
-            "☁️ Google Drive Linki İle Yükleme (Sınırsız Boyut & Hızlı)"
-        ], horizontal=True)
+        upload_mode = st.radio("Yükleme Modunu Seçiniz:", ["📄 Tekli Doküman Yükleme / Revize Etme", "📁 Toplu Çoklu Dosya Yükleme"], horizontal=True)
 
         if upload_mode == "📄 Tekli Doküman Yükleme / Revize Etme":
             with st.form(f"form_single_{dept_name}"):
@@ -477,13 +476,17 @@ else:
                             "doc_note": doc_note,
                             "uploaded_file_bytes": uploaded_file.getvalue(),
                             "uploaded_file_name": uploaded_file.name,
-                            "drive_link": "-",
                             "old_row": old_row.to_dict()
                         }
                     else:
                         _, ext = os.path.splitext(uploaded_file.name)
                         standard_fname = generate_standard_filename(doc_no, doc_title, doc_rev, ext)
+                        file_bytes = uploaded_file.getvalue()
+                        
+                        # 1. Yerel Kaydet
                         file_name = save_uploaded_file_standard(uploaded_file, UPLOAD_DIR, standard_fname)
+                        # 2. Google Drive Yükle
+                        drive_link = upload_to_google_drive(file_bytes, standard_fname)
                         
                         now_str = datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
                         
@@ -495,14 +498,14 @@ else:
                             "Revizyon No": doc_rev,
                             "Açıklama / Not": doc_note,
                             "Dosya Adı": file_name,
-                            "Drive İndirme / Görme Linki": "-",
-                            "Ekleyen": st.session_state["username"],
+                            "Drive Linki": drive_link,
+                            "Ekleyen": st.session_state["full_name"],
                             "Revizyon Mu": "Hayır"
                         }
                         df_docs = pd.concat([pd.DataFrame([new_rec]), df_docs], ignore_index=True)
                         save_data(df_docs, "Departman_Dokumanlari")
-                        add_notification(st.session_state["username"], dept_name, f"Yeni Doküman Eklendi: {doc_no} - {doc_title} (Rev: {doc_rev})")
-                        st.success(f"✅ `{doc_no}` numaralı yeni doküman Google Sheets'e eklendi: **{file_name}**")
+                        add_notification(st.session_state["full_name"], dept_name, f"Yeni Doküman Eklendi: {doc_no} - {doc_title} (Rev: {doc_rev})")
+                        st.success(f"✅ `{doc_no}` numaralı yeni doküman Google Drive ve Sheets'e eklendi: **{file_name}**")
                         st.rerun()
 
         elif upload_mode == "📁 Toplu Çoklu Dosya Yükleme":
@@ -551,7 +554,10 @@ else:
                         
                         for item in bulk_data:
                             standard_fname = generate_standard_filename(item["doc_no"], item["doc_title"], item["doc_rev"], item["ext"])
+                            f_bytes = item["file_obj"].getvalue()
+                            
                             saved_fname = save_uploaded_file_standard(item["file_obj"], UPLOAD_DIR, standard_fname)
+                            d_link = upload_to_google_drive(f_bytes, standard_fname)
                             
                             new_rec = {
                                 "Tarih / Saat": now_str,
@@ -561,73 +567,16 @@ else:
                                 "Revizyon No": item["doc_rev"],
                                 "Açıklama / Not": default_note,
                                 "Dosya Adı": saved_fname,
-                                "Drive İndirme / Görme Linki": "-",
-                                "Ekleyen": st.session_state["username"],
+                                "Drive Linki": d_link,
+                                "Ekleyen": st.session_state["full_name"],
                                 "Revizyon Mu": "Hayır"
                             }
                             df_docs = pd.concat([pd.DataFrame([new_rec]), df_docs], ignore_index=True)
                             success_count += 1
                         
                         save_data(df_docs, "Departman_Dokumanlari")
-                        add_notification(st.session_state["username"], dept_name, f"Toplu Yükleme Yapıldı: {success_count} adet doküman eklendi.")
-                        st.success(f"🎉 **{success_count}** adet dosya başarıyla **{dept_name}** bünyesine ve Google Sheets'e eklendi!")
-                        st.rerun()
-
-        elif upload_mode == "☁️ Google Drive Linki İle Yükleme (Sınırsız Boyut & Hızlı)":
-            st.info("💡 **Yöntem:** Büyük boyutlu dosyaları (veya hızlı yüklemeleri) direkt Google Drive klasörünüze yükleyip **'Bağlantıyı Kopyala'** dedikten sonra aşağıdaki kutuya yapıştırabilirsiniz.")
-            
-            with st.form(f"form_drive_{dept_name}"):
-                c1, c2 = st.columns(2)
-                d_doc_no = c1.text_input("Doküman No / Kodu (Örn: PR-01)").strip().upper()
-                d_doc_title = c2.text_input("Doküman Adı (Örn: İK Prosedürü)")
-                
-                c3, c4 = st.columns(2)
-                d_doc_rev = c3.text_input("Revizyon No", value="00").strip()
-                d_doc_note = c4.text_input("Açıklama / Revizyon Notu")
-                
-                drive_url = st.text_input("🔗 Google Drive Paylaşım Linkini Buraya Yapıştırın:")
-                submit_drive = st.form_submit_button("☁️ Drive Linkini Sistemi Kaydet")
-
-            if submit_drive:
-                if not d_doc_no or not d_doc_title or not drive_url:
-                    st.error("Lütfen Doküman No, Doküman Adı ve Drive Linkini tam giriniz.")
-                else:
-                    existing = df_docs[(df_docs["Departman"] == dept_name) & (df_docs["Doküman No"] == d_doc_no)]
-                    if not existing.empty:
-                        old_row = existing.iloc[0]
-                        st.warning(f"⚠️ **DİKKAT:** `{d_doc_no}` numaralı doküman bu departmanda zaten mevcut!")
-                        
-                        st.session_state["pending_rev"] = {
-                            "dept": dept_name,
-                            "doc_no": d_doc_no,
-                            "doc_title": d_doc_title,
-                            "doc_rev": d_doc_rev,
-                            "doc_note": d_doc_note,
-                            "uploaded_file_bytes": None,
-                            "uploaded_file_name": "Google_Drive_Baglantisi",
-                            "drive_link": drive_url,
-                            "old_row": old_row.to_dict()
-                        }
-                    else:
-                        now_str = datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
-                        standard_fname = generate_standard_filename(d_doc_no, d_doc_title, d_doc_rev, ".drive")
-                        
-                        new_rec = {
-                            "Tarih / Saat": now_str,
-                            "Departman": dept_name,
-                            "Doküman No": d_doc_no,
-                            "Doküman Adı": d_doc_title,
-                            "Revizyon No": d_doc_rev,
-                            "Açıklama / Not": d_doc_note,
-                            "Dosya Adı": standard_fname,
-                            "Drive İndirme / Görme Linki": drive_url,
-                            "Ekleyen": st.session_state["username"],
-                            "Revizyon Mu": "Hayır"
-                        }
-                        df_docs = pd.concat([pd.DataFrame([new_rec]), df_docs], ignore_index=True)
-                        save_data(df_docs, "Departman_Dokumanlari")
-                        add_notification(st.session_state["username"], dept_name, f"Drive Linki Eklendi: {d_doc_no} - {d_doc_title} (Rev: {d_doc_rev})")
-                        st.success(f"✅ `{d_doc_no}` numaralı Drive dokümanı eklendi!")
+                        add_notification(st.session_state["full_name"], dept_name, f"Toplu Yükleme Yapıldı: {success_count} adet doküman eklendi.")
+                        st.success(f"🎉 **{success_count}** adet dosya başarıyla **{dept_name}** bünyesine ve Google Drive'a eklendi!")
                         st.rerun()
 
         # REVİZYON ÇAKIŞMASI ONAY BUTONLARI
@@ -642,15 +591,18 @@ else:
                 old_info = p["old_row"]
                 old_file_name = old_info.get("Dosya Adı", "Yok")
                 
-                if old_file_name != "Yok" and os.path.exists(os.path.join(UPLOAD_DIR, old_file_name)):
+                if old_file_name != "Yok":
                     src_p = os.path.join(UPLOAD_DIR, old_file_name)
-                    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                    archived_fname = f"ARCHIVED_{timestamp}_{old_file_name}"
-                    dst_p = os.path.join(ARCHIVE_DIR, archived_fname)
-                    shutil.move(src_p, dst_p)
-                    archived_file_ref = archived_fname
+                    if os.path.exists(src_p):
+                        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                        archived_fname = f"ARCHIVED_{timestamp}_{old_file_name}"
+                        dst_p = os.path.join(ARCHIVE_DIR, archived_fname)
+                        shutil.move(src_p, dst_p)
+                        archived_file_ref = archived_fname
+                    else:
+                        archived_file_ref = old_file_name
                 else:
-                    archived_file_ref = old_file_name
+                    archived_file_ref = "Yok"
                 
                 old_archive_rec = {
                     "Tarih / Saat": old_info.get("Tarih / Saat", "-"),
@@ -660,7 +612,7 @@ else:
                     "Revizyon No": old_info.get("Revizyon No", "00"),
                     "Açıklama / Not": old_info.get("Açıklama / Not", "-"),
                     "Dosya Adı": archived_file_ref,
-                    "Drive İndirme / Görme Linki": old_info.get("Drive İndirme / Görme Linki", "-"),
+                    "Drive Linki": old_info.get("Drive Linki", "-"),
                     "Ekleyen": old_info.get("Ekleyen", "-"),
                     "Arşivlenme Tarihi": now_str
                 }
@@ -669,14 +621,15 @@ else:
                 
                 df_docs = df_docs[~((df_docs["Departman"] == dept_name) & (df_docs["Doküman No"] == p["doc_no"]))]
                 
-                if p.get("uploaded_file_bytes") is not None:
-                    _, ext = os.path.splitext(p["uploaded_file_name"])
-                    new_standard_fname = generate_standard_filename(p["doc_no"], p["doc_title"], p["doc_rev"], ext)
-                    file_path = os.path.join(UPLOAD_DIR, new_standard_fname)
-                    with open(file_path, "wb") as f:
-                        f.write(p["uploaded_file_bytes"])
-                else:
-                    new_standard_fname = generate_standard_filename(p["doc_no"], p["doc_title"], p["doc_rev"], ".drive")
+                _, ext = os.path.splitext(p["uploaded_file_name"])
+                new_standard_fname = generate_standard_filename(p["doc_no"], p["doc_title"], p["doc_rev"], ext)
+                
+                # Dosyayı hem yerel klösöre hem de Drive'a aktar
+                file_path = os.path.join(UPLOAD_DIR, new_standard_fname)
+                with open(file_path, "wb") as f:
+                    f.write(p["uploaded_file_bytes"])
+                
+                new_drive_link = upload_to_google_drive(p["uploaded_file_bytes"], new_standard_fname)
                 
                 new_rec = {
                     "Tarih / Saat": now_str,
@@ -686,29 +639,29 @@ else:
                     "Revizyon No": p["doc_rev"],
                     "Açıklama / Not": p["doc_note"],
                     "Dosya Adı": new_standard_fname,
-                    "Drive İndirme / Görme Linki": p.get("drive_link", "-"),
-                    "Ekleyen": st.session_state["username"],
+                    "Drive Linki": new_drive_link,
+                    "Ekleyen": st.session_state["full_name"],
                     "Revizyon Mu": "Evet"
                 }
                 df_docs = pd.concat([pd.DataFrame([new_rec]), df_docs], ignore_index=True)
                 save_data(df_docs, "Departman_Dokumanlari")
                 
-                add_notification(st.session_state["username"], dept_name, f"REVİZYON YAPILDI: {p['doc_no']} - {p['doc_title']} (Rev: {p['doc_rev']})")
+                add_notification(st.session_state["full_name"], dept_name, f"REVİZYON YAPILDI: {p['doc_no']} - {p['doc_title']} (Rev: {p['doc_rev']})")
                 del st.session_state["pending_rev"]
-                st.success(f"✅ Revizyon işlendi! Yeni versiyon canlıya alındı, eski versiyon Google Sheets arşivine aktarıldı.")
+                st.success(f"✅ Revizyon işlendi! Yeni dosya **{new_standard_fname}** canlıya alındı, Google Drive ve Sheets arşiv güncellendi.")
                 st.rerun()
 
             if col_rev2.button("📄 EVET, Farklı Bir Doküman Olarak Ekle"):
                 now_str = datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
                 
-                if p.get("uploaded_file_bytes") is not None:
-                    _, ext = os.path.splitext(p["uploaded_file_name"])
-                    new_standard_fname = generate_standard_filename(p["doc_no"], p["doc_title"], p["doc_rev"], ext)
-                    file_path = os.path.join(UPLOAD_DIR, new_standard_fname)
-                    with open(file_path, "wb") as f:
-                        f.write(p["uploaded_file_bytes"])
-                else:
-                    new_standard_fname = generate_standard_filename(p["doc_no"], p["doc_title"], p["doc_rev"], ".drive")
+                _, ext = os.path.splitext(p["uploaded_file_name"])
+                new_standard_fname = generate_standard_filename(p["doc_no"], p["doc_title"], p["doc_rev"], ext)
+                
+                file_path = os.path.join(UPLOAD_DIR, new_standard_fname)
+                with open(file_path, "wb") as f:
+                    f.write(p["uploaded_file_bytes"])
+                
+                new_drive_link = upload_to_google_drive(p["uploaded_file_bytes"], new_standard_fname)
                 
                 new_rec = {
                     "Tarih / Saat": now_str,
@@ -718,17 +671,17 @@ else:
                     "Revizyon No": p["doc_rev"],
                     "Açıklama / Not": p["doc_note"],
                     "Dosya Adı": new_standard_fname,
-                    "Drive İndirme / Görme Linki": p.get("drive_link", "-"),
-                    "Ekleyen": st.session_state["username"],
+                    "Drive Linki": new_drive_link,
+                    "Ekleyen": st.session_state["full_name"],
                     "Revizyon Mu": "Hayır"
                 }
                 
                 df_docs = pd.concat([pd.DataFrame([new_rec]), df_docs], ignore_index=True)
                 save_data(df_docs, "Departman_Dokumanlari")
                 
-                add_notification(st.session_state["username"], dept_name, f"Yeni Doküman Eklendi: {p['doc_no']} - {p['doc_title']} (Rev: {p['doc_rev']})")
+                add_notification(st.session_state["full_name"], dept_name, f"Yeni Doküman Eklendi: {p['doc_no']} - {p['doc_title']} (Rev: {p['doc_rev']})")
                 del st.session_state["pending_rev"]
-                st.success(f"✅ Doküman eklendi!")
+                st.success(f"✅ Doküman eklendi! Dosya adı: **{new_standard_fname}**")
                 st.rerun()
 
             if col_rev3.button("❌ İŞLEMİ İPTAL ET"):
@@ -760,17 +713,17 @@ else:
 
         for idx, row in filtered_dept_docs.iterrows():
             f_name = row.get("Dosya Adı", "Yok")
-            d_link = str(row.get("Drive İndirme / Görme Linki", "-")).strip()
+            d_link = row.get("Drive Linki", "-")
             
             c1, c2 = st.columns([3, 1])
             c1.write(f"📄 **[{row.get('Doküman No')}]** {row.get('Doküman Adı')} *(Rev: {row.get('Revizyon No')})* - Ekleyen: {row.get('Ekleyen')}")
             
             if d_link and d_link != "-":
-                c2.markdown(f"[📥 Drive'dan Gör / İndir]({d_link})")
+                c2.markdown(f"[📥 Drive Linki]({d_link})")
             elif f_name and f_name != "Yok":
                 f_path = os.path.join(UPLOAD_DIR, f_name)
                 if os.path.exists(f_path):
                     with open(f_path, "rb") as f:
-                        c2.download_button(label="📥 İndir", data=f, file_name=f_name, key=f"dept_dl_{idx}_{f_name}")
+                        c2.download_button(label="📥 İndir (Yerel)", data=f, file_name=f_name, key=f"dept_dl_{idx}_{f_name}")
     else:
         st.info(f"{dept_name} için henüz kayıtlı doküman bulunmamaktadır.")
