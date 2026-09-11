@@ -111,7 +111,7 @@ def upload_to_google_drive(file_bytes, filename, mime_type="application/octet-st
             'name': filename,
             'parents': [DRIVE_FOLDER_ID]
         }
-        media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=mime_type, resumable=True)
+        media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=mime_type, resumable=False)
         file = service.files().create(
             body=file_metadata, 
             media_body=media, 
