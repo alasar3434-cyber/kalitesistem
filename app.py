@@ -7,16 +7,91 @@ import shutil
 import re
 import zipfile
 import io
+import gspread
+from google.oauth2.service_account import Credentials
 
-# --- 1. ÇALIŞMA DİZİNİ GÜVENLİK KİLİDİ (VERİ KAYBINI ENGELLEMEK İÇİN) ---
+# --- 1. ÇALIŞMA DİZİNİ GÜVENLİK KİLİDİ ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 os.chdir(BASE_DIR)
 
 # --- SAYFA AYARLARI ---
 st.set_page_config(page_title="ALASAR GRUP - Kalite Yönetim Sistemi", page_icon="🛡️", layout="wide")
 
+# --- GOOGLE SHEETS ENTEGRASYONU ---
+SPREADSHEET_ID = "1sepPuuUSmJg3g2Yw-ZXjMLtmut2DiatH4sLqJFDiano"
+
+@st.cache_resource
+def get_gspread_client():
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    if "gcp_service_account" in st.secrets:
+        creds_dict = dict(st.secrets["gcp_service_account"])
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    else:
+        creds = Credentials.from_service_account_file("credentials.json", scopes=scopes)
+    return gspread.authorize(creds)
+
+def get_worksheet_by_name(sheet_name):
+    client = get_gspread_client()
+    sh = client.open_by_key(SPREADSHEET_ID)
+    try:
+        return sh.worksheet(sheet_name)
+    except Exception:
+        # Sayfa yoksa otomatik oluştur
+        if sheet_name == "Departman_Dokumanlari":
+            cols = ["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Ekleyen", "Revizyon Mu"]
+        elif sheet_name == "Arsiv_Dokumanlari":
+            cols = ["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Ekleyen", "Arşivlenme Tarihi"]
+        else:
+            cols = ["Tarih / Saat", "İşlemi Yapan", "Departman / Modül", "Detay / Doküman"]
+        
+        ws = sh.add_worksheet(title=sheet_name, rows="100", cols="20")
+        ws.append_row(cols)
+        return ws
+
+def load_data(sheet_name):
+    try:
+        ws = get_worksheet_by_name(sheet_name)
+        records = ws.get_all_records()
+        df = pd.DataFrame(records)
+        
+        if df.empty:
+            if sheet_name == "Departman_Dokumanlari":
+                return pd.DataFrame(columns=["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Ekleyen", "Revizyon Mu"])
+            elif sheet_name == "Arsiv_Dokumanlari":
+                return pd.DataFrame(columns=["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Ekleyen", "Arşivlenme Tarihi"])
+            else:
+                return pd.DataFrame(columns=["Tarih / Saat", "İşlemi Yapan", "Departman / Modül", "Detay / Doküman"])
+
+        if sheet_name == "Departman_Dokumanlari":
+            expected_cols = ["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Ekleyen", "Revizyon Mu"]
+            for col in expected_cols:
+                if col not in df.columns:
+                    df[col] = "Hayır" if col == "Revizyon Mu" else ("00" if col == "Revizyon No" else "-")
+        elif sheet_name == "Arsiv_Dokumanlari":
+            expected_cols = ["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Ekleyen", "Arşivlenme Tarihi"]
+            for col in expected_cols:
+                if col not in df.columns:
+                    df[col] = "-"
+        return df
+    except Exception as e:
+        st.error(f"Google Sheets okuma hatası ({sheet_name}): {e}")
+        return pd.DataFrame()
+
+def save_data(df_new, sheet_name):
+    try:
+        ws = get_worksheet_by_name(sheet_name)
+        ws.clear()
+        
+        # DataFrame verilerini temiz string formatına dönüştürüp Google Sheets'e tek seferde yaz
+        df_clean = df_new.fillna("-").astype(str)
+        ws.update([df_clean.columns.values.tolist()] + df_clean.values.tolist())
+    except Exception as e:
+        st.error(f"Google Sheets kaydetme hatası ({sheet_name}): {e}")
+
 # --- DOSYA VE KLASÖR YOLLARI ---
-EXCEL_FILE = os.path.join(BASE_DIR, "alasar_kalite_vt.xlsx")
 USERS_FILE = os.path.join(BASE_DIR, "users.json")
 UPLOAD_DIR = os.path.join(BASE_DIR, "yuklenen_belgeler")
 ARCHIVE_DIR = os.path.join(BASE_DIR, "arsivlenenler")
@@ -27,7 +102,6 @@ for d in [UPLOAD_DIR, ARCHIVE_DIR]:
 
 # --- DOSYA ADI TEMİZLEME VE STANDARTLAŞTIRMA YARDIMCI FONKSİYONLARI ---
 def clean_filename_part(text):
-    """Dosya adlarında geçersiz karakterleri temizler ve standartlaştırır."""
     if not text:
         return ""
     text_str = str(text).strip()
@@ -39,10 +113,6 @@ def clean_filename_part(text):
     return clean_str
 
 def generate_standard_filename(doc_no, doc_title, rev_no, file_extension):
-    """
-    Panel verilerine göre standart dosya adı oluşturur:
-    Format: [DOKUMAN_NO]_[DOKUMAN_ADI]_R[REV_NO].[uzanti]
-    """
     clean_no = clean_filename_part(doc_no)
     clean_title = clean_filename_part(doc_title)
     
@@ -56,7 +126,6 @@ def generate_standard_filename(doc_no, doc_title, rev_no, file_extension):
     return f"{clean_no}_{clean_title}_R{formatted_rev}{ext}"
 
 def save_uploaded_file_standard(uploaded_file, target_dir, target_filename):
-    """Yüklenen dosyayı orijinal adını yoksayarak verilen hedef adla kaydeder."""
     if uploaded_file is not None:
         file_path = os.path.join(target_dir, target_filename)
         with open(file_path, "wb") as f:
@@ -66,7 +135,6 @@ def save_uploaded_file_standard(uploaded_file, target_dir, target_filename):
 
 # --- TOPLU SIKIŞTIRMA (ZIP) YARDIMCI FONKSİYONU ---
 def create_system_zip():
-    """Yüklenen ve arşivlenen tüm fiziksel dosyaları bellekte ZIP dosyası haline getirir."""
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
         for folder in [UPLOAD_DIR, ARCHIVE_DIR]:
@@ -104,41 +172,6 @@ def save_users(users_dict):
         json.dump(users_dict, f, ensure_ascii=False, indent=4)
 
 USERS = load_users()
-
-# --- GÜVENLİ VERİ TABANI OKUMA VE KAYDETME SİSTEMİ ---
-def init_excel_db():
-    """Excel veritabanı yoksa ilk kez oluşturur."""
-    if not os.path.exists(EXCEL_FILE):
-        with pd.ExcelWriter(EXCEL_FILE, engine='openpyxl') as writer:
-            pd.DataFrame(columns=["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Ekleyen", "Revizyon Mu"]).to_excel(writer, sheet_name="Departman_Dokumanlari", index=False)
-            pd.DataFrame(columns=["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Ekleyen", "Arşivlenme Tarihi"]).to_excel(writer, sheet_name="Arsiv_Dokumanlari", index=False)
-            pd.DataFrame(columns=["Tarih / Saat", "İşlemi Yapan", "Departman / Modül", "Detay / Doküman"]).to_excel(writer, sheet_name="Bildirimler", index=False)
-
-def load_data(sheet_name):
-    init_excel_db()
-    try:
-        df = pd.read_excel(EXCEL_FILE, sheet_name=sheet_name)
-        if sheet_name == "Departman_Dokumanlari":
-            expected_cols = ["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Ekleyen", "Revizyon Mu"]
-            for col in expected_cols:
-                if col not in df.columns:
-                    df[col] = "Hayır" if col == "Revizyon Mu" else ("00" if col == "Revizyon No" else "-")
-        elif sheet_name == "Arsiv_Dokumanlari":
-            expected_cols = ["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Ekleyen", "Arşivlenme Tarihi"]
-            for col in expected_cols:
-                if col not in df.columns:
-                    df[col] = "-"
-        return df
-    except Exception:
-        return pd.DataFrame()
-
-def save_data(df_new, sheet_name):
-    init_excel_db()
-    try:
-        with pd.ExcelWriter(EXCEL_FILE, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
-            df_new.to_excel(writer, sheet_name=sheet_name, index=False)
-    except PermissionError:
-        st.error("⚠️ Excel veritabanı dosyası başka bir program tarafından açık tutuluyor. Lütfen dosyayı kapatıp tekrar deneyiniz.")
 
 def add_notification(user, modul, detail):
     df_notif = load_data("Bildirimler")
@@ -179,7 +212,7 @@ if not st.session_state["logged_in"]:
                     st.session_state["logged_in"] = True
                     st.session_state["username"] = selected_user
                     st.session_state["role"] = USERS[selected_user]["role"]
-                    st.session_state["can_edit"] = USERS[selected_user].get("can_edit", False)
+                    st.session_state["can_edit"] = selected_user in ["Ömer OCAK", "Dilber Alaşar"]
                     st.success(f"Hoş geldiniz, {selected_user}!")
                     st.rerun()
                 else:
@@ -206,16 +239,7 @@ if st.sidebar.button("🚪 Çıkış Yap"):
     st.rerun()
 
 st.sidebar.markdown("---")
-
-if os.path.exists(EXCEL_FILE):
-    with open(EXCEL_FILE, "rb") as file:
-        st.sidebar.download_button(
-            label="📥 Excel Veri Tabanını İndir",
-            data=file,
-            file_name=f"Alasar_Kalite_VT_{datetime.date.today()}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-
+st.sidebar.markdown(f"📊 **Canlı VT:** [Google Sheets Tablosu](https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID})")
 st.sidebar.markdown("---")
 
 menu_options = [
@@ -354,7 +378,7 @@ elif modul == "⚙️ SİSTEM YÖNETİMİ & BAKIŞ":
 
     st.markdown("---")
     st.markdown("### 🧹 2. Sistem Temizleme ve Tam Sıfırlama")
-    st.error("🚨 **DİKKAT:** Bu işlem sistemdeki yüklü tüm dosyaları, arşiv klasörünü ve Excel veri tabanındaki tüm kayıtları kalıcı olarak siler!")
+    st.error("🚨 **DİKKAT:** Bu işlem sistemdeki yüklü tüm dosyaları, arşiv klasörünü ve Google Sheets veri tabanındaki tüm kayıtları kalıcı olarak siler!")
     
     confirm_check = st.checkbox("Sistemdeki tüm belgeleri ve veri tabanı kayıtlarını silmek istediğimi onaylıyorum.")
     
@@ -371,13 +395,13 @@ elif modul == "⚙️ SİSTEM YÖNETİMİ & BAKIŞ":
                     except Exception as e:
                         st.error(f"Dosya silinirken hata oluştu: {file_path} - {e}")
         
-        with pd.ExcelWriter(EXCEL_FILE, engine='openpyxl') as writer:
-            pd.DataFrame(columns=["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Ekleyen", "Revizyon Mu"]).to_excel(writer, sheet_name="Departman_Dokumanlari", index=False)
-            pd.DataFrame(columns=["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Ekleyen", "Arşivlenme Tarihi"]).to_excel(writer, sheet_name="Arsiv_Dokumanlari", index=False)
-            pd.DataFrame(columns=["Tarih / Saat", "İşlemi Yapan", "Departman / Modül", "Detay / Doküman"]).to_excel(writer, sheet_name="Bildirimler", index=False)
+        # Google Sheets Tablolarını Sıfırla
+        save_data(pd.DataFrame(columns=["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Ekleyen", "Revizyon Mu"]), "Departman_Dokumanlari")
+        save_data(pd.DataFrame(columns=["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Ekleyen", "Arşivlenme Tarihi"]), "Arsiv_Dokumanlari")
+        save_data(pd.DataFrame(columns=["Tarih / Saat", "İşlemi Yapan", "Departman / Modül", "Detay / Doküman"]), "Bildirimler")
 
         add_notification("Ömer OCAK", "Sistem Yönetimi", "Tüm sistem belgeleri ve veri tabanı kayıtları sıfırlandı.")
-        st.success("✅ Tüm sistem belgeleri ve veri tabanı başarıyla temizlendi!")
+        st.success("✅ Tüm sistem belgeleri ve Google Sheets veri tabanı başarıyla temizlendi!")
         st.rerun()
 
 # --- BİLDİRİM GEÇMİŞİ MODÜLÜ ---
@@ -454,7 +478,7 @@ else:
                         df_docs = pd.concat([pd.DataFrame([new_rec]), df_docs], ignore_index=True)
                         save_data(df_docs, "Departman_Dokumanlari")
                         add_notification(st.session_state["username"], dept_name, f"Yeni Doküman Eklendi: {doc_no} - {doc_title} (Rev: {doc_rev})")
-                        st.success(f"✅ `{doc_no}` numaralı yeni doküman panel bilgileriyle başarıyla yüklendi: **{file_name}**")
+                        st.success(f"✅ `{doc_no}` numaralı yeni doküman Google Sheets'e eklendi: **{file_name}**")
                         st.rerun()
 
         elif upload_mode == "📁 Toplu Çoklu Dosya Yükleme":
@@ -521,7 +545,7 @@ else:
                         
                         save_data(df_docs, "Departman_Dokumanlari")
                         add_notification(st.session_state["username"], dept_name, f"Toplu Yükleme Yapıldı: {success_count} adet doküman eklendi.")
-                        st.success(f"🎉 **{success_count}** adet dosya başarıyla **{dept_name}** bünyesine eklendi!")
+                        st.success(f"🎉 **{success_count}** adet dosya başarıyla **{dept_name}** bünyesine ve Google Sheets'e eklendi!")
                         st.rerun()
 
         # REVİZYON ÇAKIŞMASI ONAY BUTONLARI
@@ -585,7 +609,7 @@ else:
                 
                 add_notification(st.session_state["username"], dept_name, f"REVİZYON YAPILDI: {p['doc_no']} - {p['doc_title']} (Rev: {p['doc_rev']})")
                 del st.session_state["pending_rev"]
-                st.success(f"✅ Revizyon başarıyla işlendi! Yeni dosya **{new_file_name}** olarak canlıya alındı, eski versiyon arşive kaldırıldı.")
+                st.success(f"✅ Revizyon işlendi! Yeni dosya **{new_file_name}** canlıya alındı, eski versiyon Google Sheets arşivine aktarıldı.")
                 st.rerun()
 
             if col_rev2.button("📄 EVET, Farklı Bir Doküman Olarak Ekle"):
@@ -612,7 +636,7 @@ else:
                 
                 add_notification(st.session_state["username"], dept_name, f"Yeni Doküman Eklendi: {p['doc_no']} - {p['doc_title']} (Rev: {p['doc_rev']})")
                 del st.session_state["pending_rev"]
-                st.success(f"✅ Doküman başarıyla eklendi! Dosya adı: **{new_file_name}**")
+                st.success(f"✅ Doküman eklendi! Dosya adı: **{new_file_name}**")
                 st.rerun()
 
             if col_rev3.button("❌ İŞLEMİ İPTAL ET"):
