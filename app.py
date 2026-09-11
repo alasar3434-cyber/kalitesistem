@@ -20,7 +20,7 @@ st.set_page_config(page_title="ALASAR GRUP - Kalite Yönetim Sistemi", page_icon
 
 # --- GOOGLE SHEETS & DRIVE ENTEGRASYONU ---
 SPREADSHEET_ID = "1sepPuuUSmJg3g2Yw-ZXjMLtmut2DiatH4sLqJFDiano"
-DRIVE_FOLDER_ID = "1hU-W47HVtFHb-if_BMEbw17He3b8mak9"  # App_Dokumanlar Klasör ID
+DRIVE_FOLDER_ID = "1hU-W47HVtFHb-if_BMEBw17He3b8mak9"  # App_Dokumanlar Klasör ID
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
