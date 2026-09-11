@@ -3,168 +3,88 @@ import pandas as pd
 import datetime
 import os
 import json
+import shutil
 import re
+import zipfile
 import io
+import sqlite3
 
-import gspread
-from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
+# --- 1. ÇALIŞMA DİZİNİ GÜVENLİK KİLİDİ ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+os.chdir(BASE_DIR)
 
 # --- SAYFA AYARLARI ---
 st.set_page_config(page_title="ALASAR GRUP - Kalite Yönetim Sistemi", page_icon="🛡️", layout="wide")
 
-# --- GOOGLE API & CREDENTIALS BAĞLANTISI ---
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive"
-]
+# --- DOSYA VE KLASÖR YOLLARI ---
+DB_FILE = os.path.join(BASE_DIR, "alasar_kalite.db")
+USERS_FILE = os.path.join(BASE_DIR, "users.json")
+UPLOAD_DIR = os.path.join(BASE_DIR, "yuklenen_belgeler")
+ARCHIVE_DIR = os.path.join(BASE_DIR, "arsivlenenler")
 
-@st.cache_resource
-def get_google_services():
-    """Google Sheets ve Drive servislerine Secrets üzerinden güvenli erişim sağlar."""
-    try:
-        creds_dict = dict(st.secrets["gcp_service_account"])
-        creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
-        
-        # gspread Client
-        gc = gspread.authorize(creds)
-        
-        # Drive API Service
-        drive_service = build('drive', 'v3', credentials=creds)
-        
-        return gc, drive_service
-    except Exception as e:
-        st.error(f"Google servislerine bağlanırken hata oluştu: {e}")
-        st.stop()
+for d in [UPLOAD_DIR, ARCHIVE_DIR]:
+    if not os.path.exists(d):
+        os.makedirs(d)
 
-gc, drive_service = get_google_services()
+# --- SQLITE VERİTABANI BAĞLANTISI VE TABLO İLKLEME ---
+def get_db_connection():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-# --- GOOGLE SHEETS VERİ TABANI AYARLARI ---
-SPREADSHEET_NAME = "Alasar_Kalite_VT"
-
-@st.cache_resource
-def get_or_create_spreadsheet():
-    """Google Sheets dosyasını kontrol eder, yoksa oluşturur ve yapılandırır."""
-    try:
-        sh = gc.open(SPREADSHEET_NAME)
-    except gspread.exceptions.SpreadsheetNotFound:
-        sh = gc.create(SPREADSHEET_NAME)
-        # Varsayılan sayfalar
-        ws1 = sh.sheet1
-        ws1.update_title("Departman_Dokumanlari")
-        ws1.append_row(["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Ekleyen", "Revizyon Mu", "Drive_File_ID"])
-        
-        ws2 = sh.add_worksheet(title="Arsiv_Dokumanlari", rows=100, cols=20)
-        ws2.append_row(["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Ekleyen", "Arşivlenme Tarihi", "Drive_File_ID"])
-        
-        ws3 = sh.add_worksheet(title="Bildirimler", rows=100, cols=10)
-        ws3.append_row(["Tarih / Saat", "İşlemi Yapan", "Departman / Modül", "Detay / Doküman"])
-    return sh
-
-spreadsheet = get_or_create_spreadsheet()
-
-def load_data(sheet_name):
-    """Google Sheets üzerinden verileri Pandas DataFrame olarak çeker."""
-    try:
-        worksheet = spreadsheet.worksheet(sheet_name)
-        data = worksheet.get_all_records()
-        df = pd.DataFrame(data)
-        return df
-    except Exception as e:
-        return pd.DataFrame()
-
-def save_data(df, sheet_name):
-    """Pandas DataFrame verisini Google Sheets tablosuna yazar."""
-    try:
-        worksheet = spreadsheet.worksheet(sheet_name)
-        worksheet.clear()
-        worksheet.update([df.columns.values.tolist()] + df.astype(str).values.tolist())
-    except Exception as e:
-        st.error(f"Veri kaydedilirken hata oluştu ({sheet_name}): {e}")
-
-def add_notification(user, modul, detail):
-    df_notif = load_data("Bildirimler")
-    now_str = datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
-    new_notif = {
-        "Tarih / Saat": now_str,
-        "İşlemi Yapan": user,
-        "Departman / Modül": modul,
-        "Detay / Doküman": detail
-    }
-    df_notif = pd.concat([pd.DataFrame([new_notif]), df_notif], ignore_index=True)
-    save_data(df_notif, "Bildirimler")
-
-# --- GOOGLE DRIVE KLASÖR VE DOSYA YÖNETİMİ ---
-@st.cache_data
-def get_or_create_drive_folder(folder_name, parent_id=None):
-    """Drive üzerinde klasör arar, yoksa yeni oluşturur."""
-    query = f"mimeType='application/vnd.google-apps.folder' and name='{folder_name}' and trashed=false"
-    if parent_id:
-        query += f" and '{parent_id}' in parents"
+def init_sqlite_db():
+    conn = get_db_connection()
+    cursor = conn.cursor()
     
-    results = drive_service.files().list(q=query, fields="files(id, name)").execute()
-    items = results.get('files', [])
+    # Departman Dokümanları Tablosu
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS departman_dokumanlari (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tarih_saat TEXT,
+            departman TEXT,
+            dokuman_no TEXT,
+            dokuman_adi TEXT,
+            revizyon_no TEXT,
+            aciklama_not TEXT,
+            dosya_adi TEXT,
+            ekleyen TEXT,
+            revizyon_mu TEXT DEFAULT 'Hayır'
+        )
+    ''')
     
-    if items:
-        return items[0]['id']
-    else:
-        file_metadata = {
-            'name': folder_name,
-            'mimeType': 'application/vnd.google-apps.folder'
-        }
-        if parent_id:
-            file_metadata['parents'] = [parent_id]
-        folder = drive_service.files().create(body=file_metadata, fields='id').execute()
-        return folder.get('id')
+    # Arşiv Dokümanları Tablosu
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS arsiv_dokumanlari (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tarih_saat TEXT,
+            departman TEXT,
+            dokuman_no TEXT,
+            dokuman_adi TEXT,
+            revizyon_no TEXT,
+            aciklama_not TEXT,
+            dosya_adi TEXT,
+            ekleyen TEXT,
+            arsivlenme_tarihi TEXT
+        )
+    ''')
+    
+    # Bildirimler Tablosu
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS bildirimler (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tarih_saat TEXT,
+            islemi_yapan TEXT,
+            departman_modul TEXT,
+            detay_dokuman TEXT
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
 
-UPLOAD_FOLDER_ID = get_or_create_drive_folder("YUKLENEN_BELGELER")
-ARCHIVE_FOLDER_ID = get_or_create_drive_folder("ARSIVLENENLER")
+init_sqlite_db()
 
-def upload_to_drive(uploaded_file, file_name, folder_id):
-    """Streamlit file_uploader dosyasını doğrudan Google Drive'a yükler."""
-    file_metadata = {
-        'name': file_name,
-        'parents': [folder_id]
-    }
-    media = MediaIoBaseUpload(io.BytesIO(uploaded_file.getbuffer()), mimetype=uploaded_file.type, resumable=True)
-    file = drive_service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink, webContentLink').execute()
-    return file.get('id')
-
-def move_drive_file(file_id, from_folder_id, to_folder_id, new_name=None):
-    """Drive üzerindeki bir dosyayı klasörler arası taşır (Arşivleme için)."""
-    try:
-        file = drive_service.files().get(fileId=file_id, fields='parents').execute()
-        previous_parents = ",".join(file.get('parents', []))
-        
-        body = {}
-        if new_name:
-            body['name'] = new_name
-            
-        drive_service.files().update(
-            fileId=file_id,
-            addParents=to_folder_id,
-            removeParents=previous_parents,
-            body=body,
-            fields='id, parents'
-        ).execute()
-        return True
-    except Exception as e:
-        st.error(f"Drive dosya taşıma hatası: {e}")
-        return False
-
-def download_from_drive(file_id):
-    """Drive üzerindeki dosyayı indirmek için bayt nesnesi döner."""
-    request = drive_service.files().get_media(fileId=file_id)
-    fh = io.BytesIO()
-    downloader = MediaIoBaseDownload(fh, request)
-    done = False
-    while done is False:
-        status, done = downloader.next_chunk()
-    fh.seek(0)
-    return fh.read()
-
-# --- DOSYA ADI TEMİZLEME VE STANDARTLAŞTIRMA YARDIMCI FONKSİYONLARI ---
+# --- YARDIMCI FONKSİYONLAR ---
 def clean_filename_part(text):
     if not text:
         return ""
@@ -189,7 +109,28 @@ def generate_standard_filename(doc_no, doc_title, rev_no, file_extension):
     ext = file_extension if file_extension.startswith(".") else f".{file_extension}"
     return f"{clean_no}_{clean_title}_R{formatted_rev}{ext}"
 
-# --- KULLANICI LİSTESİ VE ŞİFRELER ---
+def save_uploaded_file_standard(uploaded_file, target_dir, target_filename):
+    if uploaded_file is not None:
+        file_path = os.path.join(target_dir, target_filename)
+        with open(file_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+        return target_filename
+    return "Yok"
+
+def create_system_zip():
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        for folder in [UPLOAD_DIR, ARCHIVE_DIR]:
+            if os.path.exists(folder):
+                for root, _, files in os.walk(folder):
+                    for file in files:
+                        file_path = os.path.join(root, file)
+                        arcname = os.path.join(os.path.basename(folder), file)
+                        zip_file.write(file_path, arcname)
+    zip_buffer.seek(0)
+    return zip_buffer
+
+# --- KULLANICI İŞLEMLERİ ---
 DEFAULT_USERS = {
     "Mehmet Alaşar": {"password": "malsr3434.", "role": "Yönetici", "can_edit": False},
     "Dilber Alaşar": {"password": "dalsr4141.", "role": "Yönetici", "can_edit": True},
@@ -197,10 +138,40 @@ DEFAULT_USERS = {
     "Ömer OCAK": {"password": "oock6161.", "role": "Kalite Sistem Mühendisi", "can_edit": True}
 }
 
-if "users" not in st.session_state:
-    st.session_state["users"] = DEFAULT_USERS
+def load_users():
+    if os.path.exists(USERS_FILE):
+        try:
+            with open(USERS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return DEFAULT_USERS
+    else:
+        save_users(DEFAULT_USERS)
+        return DEFAULT_USERS
 
-USERS = st.session_state["users"]
+def save_users(users_dict):
+    with open(USERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(users_dict, f, ensure_ascii=False, indent=4)
+
+USERS = load_users()
+
+# --- SQL İŞLEM YARDIMCILARI ---
+def add_notification(user, modul, detail):
+    now_str = datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO bildirimler (tarih_saat, islemi_yapan, departman_modul, detay_dokuman)
+        VALUES (?, ?, ?, ?)
+    ''', (now_str, user, modul, detail))
+    conn.commit()
+    conn.close()
+
+def get_df_from_query(query, params=()):
+    conn = get_db_connection()
+    df = pd.read_sql_query(query, conn, params=params)
+    conn.close()
+    return df
 
 # --- OTURUM DURUMU ---
 if "logged_in" not in st.session_state:
@@ -212,7 +183,7 @@ if "role" not in st.session_state:
 if "can_edit" not in st.session_state:
     st.session_state["can_edit"] = False
 
-# --- GİRİŞ EKRANI (LOGIN) ---
+# --- GİRİŞ EKRANI ---
 if not st.session_state["logged_in"]:
     st.title("🏢 ALASAR GRUP")
     st.subheader("Kalite & Departman Yönetim Sistemi - Giriş Paneli")
@@ -229,14 +200,14 @@ if not st.session_state["logged_in"]:
                     st.session_state["logged_in"] = True
                     st.session_state["username"] = selected_user
                     st.session_state["role"] = USERS[selected_user]["role"]
-                    st.session_state["can_edit"] = selected_user in ["Ömer OCAK", "Dilber Alaşar"]
+                    st.session_state["can_edit"] = USERS[selected_user]["can_edit"]
                     st.success(f"Hoş geldiniz, {selected_user}!")
                     st.rerun()
                 else:
                     st.error("Hatalı şifre! Lütfen tekrar deneyiniz.")
     st.stop()
 
-# --- ANA SİSTEM SOL MENÜ ---
+# --- SOL MENÜ ---
 st.sidebar.title("🏢 ALASAR GRUP")
 st.sidebar.write(f"👤 **{st.session_state['username']}**")
 st.sidebar.caption(f"Rol: {st.session_state['role']}")
@@ -275,7 +246,6 @@ modul = st.sidebar.radio("DEPARTMANLAR VE MENÜ:", menu_options)
 
 st.sidebar.markdown("---")
 
-# --- KULLANICI ŞİFRE DEĞİŞTİRME ALANI ---
 with st.sidebar.expander("🔑 Şifremi Değiştir"):
     with st.form("change_password_form", clear_on_submit=True):
         old_pass = st.text_input("Mevcut Şifre", type="password")
@@ -293,119 +263,142 @@ with st.sidebar.expander("🔑 Şifremi Değiştir"):
                 st.error("Şifre en az 4 karakter olmalıdır!")
             else:
                 USERS[current_user]["password"] = new_pass
-                st.session_state["users"] = USERS
+                save_users(USERS)
                 st.success("Şifreniz başarıyla değiştirildi!")
 
 # --- CANLI BİLDİRİM PANELİ ---
-df_notif_top = load_data("Bildirimler")
+df_notif_top = get_df_from_query("SELECT * FROM bildirimler ORDER BY id DESC LIMIT 1")
 if not df_notif_top.empty:
     latest = df_notif_top.iloc[0]
-    dept_val = latest.get('Departman / Modül', latest.get('Modül', 'Genel'))
-    time_val = latest.get('Tarih / Saat', '-')
-    user_val = latest.get('İşlemi Yapan', '-')
-    detail_val = latest.get('Detay / Doküman', '-')
-    st.info(f"🔔 **Son Güncelleme / Revizyon Bildirimi:** [{time_val}] **{user_val}** tarafından **{dept_val}** alanında işlem yapıldı: *{detail_val}*")
+    st.info(f"🔔 **Son Güncelleme / Revizyon Bildirimi:** [{latest['tarih_saat']}] **{latest['islemi_yapan']}** tarafından **{latest['departman_modul']}** alanında işlem yapıldı: *{latest['detay_dokuman']}*")
 
 # --- GENEL ARAMA MERKEZİ ---
 if modul == "🔍 GENEL ARAMA MERKEZİ":
     st.title("🔍 Tüm Sistem Genel Doküman Arama Merkezi")
-    st.caption("Sistemdeki tüm aktif ve arşivlenmiş dokümanları departman bağımsız tek bir arama çubuğu üzerinden anında sorgulayabilirsiniz.")
+    st.caption("Sistemdeki tüm aktif ve arşivlenmiş dokümanları SQLite veritabanı üzerinden anında sorgulayabilirsiniz.")
 
-    search_query = st.text_input("🔎 Doküman Adı, Doküman No, Açıklama veya Yükleyen Kişi Ara...", key="global_search").strip().lower()
+    search_query = st.text_input("🔎 Doküman Adı, Doküman No, Açıklama veya Yükleyen Kişi Ara...", key="global_search").strip()
     
-    df_docs = load_data("Departman_Dokumanlari")
-    df_archive = load_data("Arsiv_Dokumanlari")
-
     tab_g1, tab_g2 = st.tabs(["📄 Aktif Dokümanlar İçinde Ara", "📁 Arşiv Dokümanları İçinde Ara"])
     
     with tab_g1:
-        if not df_docs.empty:
-            if search_query:
-                filtered_df = df_docs[
-                    df_docs["Doküman Adı"].astype(str).str.lower().str.contains(search_query) |
-                    df_docs["Doküman No"].astype(str).str.lower().str.contains(search_query) |
-                    df_docs["Açıklama / Not"].astype(str).str.lower().str.contains(search_query) |
-                    df_docs["Departman"].astype(str).str.lower().str.contains(search_query) |
-                    df_docs["Ekleyen"].astype(str).str.lower().str.contains(search_query)
-                ]
-            else:
-                filtered_df = df_docs
+        if search_query:
+            q = "%" + search_query + "%"
+            df_docs = get_df_from_query('''
+                SELECT tarih_saat AS "Tarih / Saat", departman AS "Departman", dokuman_no AS "Doküman No", 
+                       dokuman_adi AS "Doküman Adı", revizyon_no AS "Revizyon No", aciklama_not AS "Açıklama / Not", 
+                       dosya_adi AS "Dosya Adı", ekleyen AS "Ekleyen", revizyon_mu AS "Revizyon Mu"
+                FROM departman_dokumanlari 
+                WHERE dokuman_adi LIKE ? OR dokuman_no LIKE ? OR aciklama_not LIKE ? OR departman LIKE ? OR ekleyen LIKE ?
+                ORDER BY id DESC
+            ''', (q, q, q, q, q))
+        else:
+            df_docs = get_df_from_query('''
+                SELECT tarih_saat AS "Tarih / Saat", departman AS "Departman", dokuman_no AS "Doküman No", 
+                       dokuman_adi AS "Doküman Adı", revizyon_no AS "Revizyon No", aciklama_not AS "Açıklama / Not", 
+                       dosya_adi AS "Dosya Adı", ekleyen AS "Ekleyen", revizyon_mu AS "Revizyon Mu"
+                FROM departman_dokumanlari ORDER BY id DESC
+            ''')
 
-            st.write(f"Bulunan Doküman Sayısı: **{len(filtered_df)}**")
-            st.dataframe(filtered_df, use_container_width=True)
+        st.write(f"Bulunan Doküman Sayısı: **{len(df_docs)}**")
+        st.dataframe(df_docs, use_container_width=True)
 
-            for idx, row in filtered_df.iterrows():
-                file_id = row.get("Drive_File_ID", "")
-                f_name = row.get("Dosya Adı", "Yok")
-                if file_id and file_id != "None" and file_id != "":
+        for idx, row in df_docs.iterrows():
+            f_name = row.get("Dosya Adı", "Yok")
+            if f_name and f_name != "Yok":
+                f_path = os.path.join(UPLOAD_DIR, f_name)
+                if os.path.exists(f_path):
                     c1, c2 = st.columns([3, 1])
                     c1.write(f"📄 **[{row.get('Departman')}]** - **[{row.get('Doküman No')}]** {row.get('Doküman Adı')} *(Rev: {row.get('Revizyon No')})*")
-                    try:
-                        file_bytes = download_from_drive(file_id)
-                        c2.download_button(label="📥 İndir", data=file_bytes, file_name=f_name, key=f"glob_act_{idx}_{file_id}")
-                    except Exception:
-                        c2.caption("⚠️ İndirilemedi")
-        else:
-            st.info("Sistemde henüz aktif doküman bulunmuyor.")
+                    with open(f_path, "rb") as f:
+                        c2.download_button(label="📥 İndir", data=f, file_name=f_name, key=f"glob_act_{idx}_{f_name}")
 
     with tab_g2:
-        if not df_archive.empty:
-            if search_query:
-                filtered_arch = df_archive[
-                    df_archive["Doküman Adı"].astype(str).str.lower().str.contains(search_query) |
-                    df_archive["Doküman No"].astype(str).str.lower().str.contains(search_query) |
-                    df_archive["Açıklama / Not"].astype(str).str.lower().str.contains(search_query) |
-                    df_archive["Departman"].astype(str).str.lower().str.contains(search_query) |
-                    df_archive["Ekleyen"].astype(str).str.lower().str.contains(search_query)
-                ]
-            else:
-                filtered_arch = df_archive
+        if search_query:
+            q = "%" + search_query + "%"
+            df_arch = get_df_from_query('''
+                SELECT tarih_saat AS "Tarih / Saat", departman AS "Departman", dokuman_no AS "Doküman No", 
+                       dokuman_adi AS "Doküman Adı", revizyon_no AS "Revizyon No", aciklama_not AS "Açıklama / Not", 
+                       dosya_adi AS "Dosya Adı", ekleyen AS "Ekleyen", arsivlenme_tarihi AS "Arşivlenme Tarihi"
+                FROM arsiv_dokumanlari 
+                WHERE dokuman_adi LIKE ? OR dokuman_no LIKE ? OR aciklama_not LIKE ? OR departman LIKE ? OR ekleyen LIKE ?
+                ORDER BY id DESC
+            ''', (q, q, q, q, q))
+        else:
+            df_arch = get_df_from_query('''
+                SELECT tarih_saat AS "Tarih / Saat", departman AS "Departman", dokuman_no AS "Doküman No", 
+                       dokuman_adi AS "Doküman Adı", revizyon_no AS "Revizyon No", aciklama_not AS "Açıklama / Not", 
+                       dosya_adi AS "Dosya Adı", ekleyen AS "Ekleyen", arsivlenme_tarihi AS "Arşivlenme Tarihi"
+                FROM arsiv_dokumanlari ORDER BY id DESC
+            ''')
 
-            st.write(f"Bulunan Arşiv Doküman Sayısı: **{len(filtered_arch)}**")
-            st.dataframe(filtered_arch, use_container_width=True)
+        st.write(f"Bulunan Arşiv Doküman Sayısı: **{len(df_arch)}**")
+        st.dataframe(df_arch, use_container_width=True)
 
-            for idx, row in filtered_arch.iterrows():
-                file_id = row.get("Drive_File_ID", "")
-                f_name = row.get("Dosya Adı", "Yok")
-                if file_id and file_id != "None" and file_id != "":
+        for idx, row in df_arch.iterrows():
+            f_name = row.get("Dosya Adı", "Yok")
+            if f_name and f_name != "Yok":
+                f_path = os.path.join(ARCHIVE_DIR, f_name)
+                if os.path.exists(f_path):
                     c1, c2 = st.columns([3, 1])
                     c1.write(f"📁 **[{row.get('Departman')}]** - **[{row.get('Doküman No')}]** {row.get('Doküman Adı')} *(Rev: {row.get('Revizyon No')})* - Arşiv: {row.get('Arşivlenme Tarihi')}")
-                    try:
-                        file_bytes = download_from_drive(file_id)
-                        c2.download_button(label="📥 Eski Versiyonu İndir", data=file_bytes, file_name=f_name, key=f"glob_arch_{idx}_{file_id}")
-                    except Exception:
-                        c2.caption("⚠️ İndirilemedi")
-        else:
-            st.info("Sistemde henüz arşivlenmiş doküman bulunmuyor.")
+                    with open(f_path, "rb") as f:
+                        c2.download_button(label="📥 Eski Versiyonu İndir", data=f, file_name=f_name, key=f"glob_arch_{idx}_{f_name}")
 
 # --- SİSTEM YÖNETİMİ & TEMİZLEME MODÜLÜ ---
 elif modul == "⚙️ SİSTEM YÖNETİMİ & BAKIŞ":
     st.title("⚙️ Sistem Yönetimi ve Toplu İşlem Paneli")
     st.warning("⚠️ Bu panel sadece **Ömer OCAK** tarafından görüntülenebilir ve yetkilendirilmiştir.")
 
-    st.markdown("### 🧹 Sistem Temizleme ve Tam Sıfırlama")
-    st.error("🚨 **DİKKAT:** Bu işlem Google Sheets üzerindeki tüm kayıtları ve Drive üzerindeki referansları temizler!")
+    st.markdown("### 📦 1. Tüm Belgeleri Toplu İndir (ZIP)")
+    zip_data = create_system_zip()
+    st.download_button(
+        label="📦 Tüm Sistem Dosyalarını İndir (.ZIP)",
+        data=zip_data,
+        file_name=f"Alasar_Tum_Sistem_Belgeleri_{datetime.date.today()}.zip",
+        mime="application/zip",
+        key="btn_zip_all"
+    )
+
+    st.markdown("---")
+    st.markdown("### 🧹 2. Sistem Temizleme ve Tam Sıfırlama")
+    st.error("🚨 **DİKKAT:** Bu işlem sistemdeki yüklü tüm dosyaları, arşiv klasörünü ve SQLite veritabanındaki tüm kayıtları kalıcı olarak siler!")
     
-    confirm_check = st.checkbox("Sistemdeki tüm belgeleri ve veri tabanı kayıtlarını silmek istediğimi onaylıyorum.")
+    confirm_check = st.checkbox("Sistemdeki tüm belgeleri ve veritabanı kayıtlarını silmek istediğimi onaylıyorum.")
     
     if st.button("🔴 SİSTEMİ VE TÜM BELGELERİ TEMİZLE", disabled=not confirm_check):
-        empty_dept = pd.DataFrame(columns=["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Ekleyen", "Revizyon Mu", "Drive_File_ID"])
-        empty_arch = pd.DataFrame(columns=["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Ekleyen", "Arşivlenme Tarihi", "Drive_File_ID"])
-        empty_notif = pd.DataFrame(columns=["Tarih / Saat", "İşlemi Yapan", "Departman / Modül", "Detay / Doküman"])
+        for folder in [UPLOAD_DIR, ARCHIVE_DIR]:
+            if os.path.exists(folder):
+                for filename in os.listdir(folder):
+                    file_path = os.path.join(folder, filename)
+                    try:
+                        if os.path.isfile(file_path) or os.path.islink(file_path):
+                            os.unlink(file_path)
+                        elif os.path.isdir(file_path):
+                            shutil.rmtree(file_path)
+                    except Exception as e:
+                        st.error(f"Dosya silinirken hata oluştu: {file_path} - {e}")
         
-        save_data(empty_dept, "Departman_Dokumanlari")
-        save_data(empty_arch, "Arsiv_Dokumanlari")
-        save_data(empty_notif, "Bildirimler")
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM departman_dokumanlari")
+        cursor.execute("DELETE FROM arsiv_dokumanlari")
+        cursor.execute("DELETE FROM bildirimler")
+        conn.commit()
+        conn.close()
 
-        add_notification("Ömer OCAK", "Sistem Yönetimi", "Tüm sistem belgeleri ve veri tabanı kayıtları sıfırlandı.")
-        st.success("✅ Tüm sistem belgeleri ve veri tabanı başarıyla temizlendi!")
+        add_notification("Ömer OCAK", "Sistem Yönetimi", "Tüm sistem belgeleri ve veritabanı kayıtları sıfırlandı.")
+        st.success("✅ Tüm sistem belgeleri ve SQLite veritabanı başarıyla temizlendi!")
         st.rerun()
 
 # --- BİLDİRİM GEÇMİŞİ MODÜLÜ ---
 elif modul == "🔔 Bildirim Geçmişi":
     st.title("🔔 Tüm Güncelleme & Revizyon Geçmişi")
-    st.write("Sistem üzerinde yapılan tüm departman doküman yükleme, revizyon ve arşivleme işlemlerinin dökümü:")
-    df_notif_all = load_data("Bildirimler")
+    df_notif_all = get_df_from_query('''
+        SELECT tarih_saat AS "Tarih / Saat", islemi_yapan AS "İşlemi Yapan", 
+               departman_modul AS "Departman / Modül", detay_dokuman AS "Detay / Doküman"
+        FROM bildirimler ORDER BY id DESC
+    ''')
     st.dataframe(df_notif_all, use_container_width=True)
 
 # --- DEPARTMAN MODÜLLERİ ---
@@ -414,13 +407,8 @@ else:
     st.title(f"📂 {dept_name}")
     st.caption(f"{dept_name} bünyesine ait tüm prosedür, talimat, form ve revize dokümanlar bu alanda yönetilir.")
     
-    df_docs = load_data("Departman_Dokumanlari")
-    df_archive = load_data("Arsiv_Dokumanlari")
-    
-    # DOKÜMAN YÜKLEME ALANI
     if st.session_state["can_edit"]:
         st.subheader(f"📤 {dept_name} İçin Doküman Yükleme Paneli")
-        
         upload_mode = st.radio("Yükleme Modunu Seçiniz:", ["📄 Tekli Doküman Yükleme / Revize Etme", "📁 Toplu Çoklu Dosya Yükleme"], horizontal=True)
 
         if upload_mode == "📄 Tekli Doküman Yükleme / Revize Etme":
@@ -430,7 +418,7 @@ else:
                 doc_title = col2.text_input("Doküman Adı (Örn: İK Prosedürü, İzin Formu)")
                 doc_rev = col3.text_input("Revizyon No", value="00").strip()
                 doc_note = col4.text_input("Açıklama / Revizyon Notu (Örn: Maddeler Güncellendi)")
-                uploaded_file = st.file_uploader("Dosya Seçiniz (PDF, Word, Excel vb.)", type=["pdf", "png", "jpg", "jpeg", "xlsx", "docx", "zip", "rar"])
+                uploaded_file = st.file_uploader("Dosya Seçiniz", type=["pdf", "png", "jpg", "jpeg", "xlsx", "docx", "zip", "rar"])
                 
                 submit_doc = st.form_submit_button("🔍 Dokümanı İncele ve İlerle")
             
@@ -438,12 +426,15 @@ else:
                 if not doc_no or not doc_title or uploaded_file is None:
                     st.error("Lütfen Doküman Numarası, Doküman Adı giriniz ve bir dosya seçiniz.")
                 else:
-                    existing = df_docs[(df_docs["Departman"] == dept_name) & (df_docs["Doküman No"] == doc_no)] if not df_docs.empty else pd.DataFrame()
+                    conn = get_db_connection()
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT * FROM departman_dokumanlari WHERE departman=? AND dokuman_no=?", (dept_name, doc_no))
+                    existing = cursor.fetchone()
+                    conn.close()
                     
-                    if not existing.empty:
-                        old_row = existing.iloc[0]
-                        st.warning(f"⚠️ **DİKKAT:** `{doc_no}` numaralı **'{old_row['Doküman Adı']}'** isimli doküman bu departmanda zaten mevcut!")
-                        st.info(f"📌 **Mevcut Dosya:** {old_row['Dosya Adı']} | **Revizyon:** {old_row.get('Revizyon No', '00')} | **Yükleyen:** {old_row['Ekleyen']} | **Tarih:** {old_row['Tarih / Saat']}")
+                    if existing:
+                        st.warning(f"⚠️ **DİKKAT:** `{doc_no}` numaralı **'{existing['dokuman_adi']}'** isimli doküman bu departmanda zaten mevcut!")
+                        st.info(f"📌 **Mevcut Dosya:** {existing['dosya_adi']} | **Revizyon:** {existing['revizyon_no']} | **Yükleyen:** {existing['ekleyen']} | **Tarih:** {existing['tarih_saat']}")
                         
                         st.session_state["pending_rev"] = {
                             "dept": dept_name,
@@ -452,31 +443,26 @@ else:
                             "doc_rev": doc_rev,
                             "doc_note": doc_note,
                             "uploaded_file": uploaded_file,
-                            "old_row": old_row.to_dict()
+                            "old_row": dict(existing)
                         }
                     else:
                         _, ext = os.path.splitext(uploaded_file.name)
                         standard_fname = generate_standard_filename(doc_no, doc_title, doc_rev, ext)
-                        
-                        file_id = upload_to_drive(uploaded_file, standard_fname, UPLOAD_FOLDER_ID)
+                        file_name = save_uploaded_file_standard(uploaded_file, UPLOAD_DIR, standard_fname)
                         now_str = datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
                         
-                        new_rec = {
-                            "Tarih / Saat": now_str,
-                            "Departman": dept_name,
-                            "Doküman No": doc_no,
-                            "Doküman Adı": doc_title,
-                            "Revizyon No": doc_rev,
-                            "Açıklama / Not": doc_note,
-                            "Dosya Adı": standard_fname,
-                            "Ekleyen": st.session_state["username"],
-                            "Revizyon Mu": "Hayır",
-                            "Drive_File_ID": file_id
-                        }
-                        df_docs = pd.concat([pd.DataFrame([new_rec]), df_docs], ignore_index=True)
-                        save_data(df_docs, "Departman_Dokumanlari")
+                        conn = get_db_connection()
+                        cursor = conn.cursor()
+                        cursor.execute('''
+                            INSERT INTO departman_dokumanlari 
+                            (tarih_saat, departman, dokuman_no, dokuman_adi, revizyon_no, aciklama_not, dosya_adi, ekleyen, revizyon_mu)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Hayır')
+                        ''', (now_str, dept_name, doc_no, doc_title, doc_rev, doc_note, file_name, st.session_state["username"]))
+                        conn.commit()
+                        conn.close()
+                        
                         add_notification(st.session_state["username"], dept_name, f"Yeni Doküman Eklendi: {doc_no} - {doc_title} (Rev: {doc_rev})")
-                        st.success(f"✅ `{doc_no}` numaralı yeni doküman Google Drive ve Sheets'e kaydedildi: **{standard_fname}**")
+                        st.success(f"✅ `{doc_no}` numaralı yeni doküman eklendi: **{file_name}**")
                         st.rerun()
 
         elif upload_mode == "📁 Toplu Çoklu Dosya Yükleme":
@@ -488,8 +474,6 @@ else:
             )
 
             if uploaded_files:
-                st.subheader(f"📋 Toplu Dosya Onay Tablosu ({dept_name})")
-                
                 with st.form(f"bulk_form_{dept_name}"):
                     default_note = st.text_input("Ortak Açıklama / Not (Opsiyonel)", value="Toplu Yükleme", key=f"b_note_{dept_name}")
                     st.markdown("---")
@@ -507,7 +491,6 @@ else:
                         if chk:
                             bulk_data.append({
                                 "file_obj": file,
-                                "orig_name": file.name,
                                 "ext": ext,
                                 "doc_no": doc_no_val,
                                 "doc_title": base_name,
@@ -516,38 +499,28 @@ else:
                     
                     submit_bulk = st.form_submit_button("🚀 SEÇİLİ DOSYALARI DEPARTMANA YÜKLE")
 
-                if submit_bulk:
-                    if not bulk_data:
-                        st.warning("Lütfen işlem yapmak için en az bir dosyanın yanındaki tik kutusunu işaretleyin.")
-                    else:
-                        success_count = 0
-                        now_str = datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
+                if submit_bulk and bulk_data:
+                    now_str = datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
+                    conn = get_db_connection()
+                    cursor = conn.cursor()
+                    
+                    for item in bulk_data:
+                        standard_fname = generate_standard_filename(item["doc_no"], item["doc_title"], item["doc_rev"], item["ext"])
+                        saved_fname = save_uploaded_file_standard(item["file_obj"], UPLOAD_DIR, standard_fname)
                         
-                        for item in bulk_data:
-                            standard_fname = generate_standard_filename(item["doc_no"], item["doc_title"], item["doc_rev"], item["ext"])
-                            file_id = upload_to_drive(item["file_obj"], standard_fname, UPLOAD_FOLDER_ID)
-                            
-                            new_rec = {
-                                "Tarih / Saat": now_str,
-                                "Departman": dept_name,
-                                "Doküman No": item["doc_no"].upper(),
-                                "Doküman Adı": item["doc_title"],
-                                "Revizyon No": item["doc_rev"],
-                                "Açıklama / Not": default_note,
-                                "Dosya Adı": standard_fname,
-                                "Ekleyen": st.session_state["username"],
-                                "Revizyon Mu": "Hayır",
-                                "Drive_File_ID": file_id
-                            }
-                            df_docs = pd.concat([pd.DataFrame([new_rec]), df_docs], ignore_index=True)
-                            success_count += 1
-                        
-                        save_data(df_docs, "Departman_Dokumanlari")
-                        add_notification(st.session_state["username"], dept_name, f"Toplu Yükleme Yapıldı: {success_count} adet doküman eklendi.")
-                        st.success(f"🎉 **{success_count}** adet dosya başarıyla Google Drive'a yüklendi!")
-                        st.rerun()
+                        cursor.execute('''
+                            INSERT INTO departman_dokumanlari 
+                            (tarih_saat, departman, dokuman_no, dokuman_adi, revizyon_no, aciklama_not, dosya_adi, ekleyen, revizyon_mu)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Hayır')
+                        ''', (now_str, dept_name, item["doc_no"].upper(), item["doc_title"], item["doc_rev"], default_note, saved_fname, st.session_state["username"]))
+                    
+                    conn.commit()
+                    conn.close()
+                    add_notification(st.session_state["username"], dept_name, f"Toplu Yükleme Yapıldı: {len(bulk_data)} adet doküman eklendi.")
+                    st.success(f"🎉 **{len(bulk_data)}** adet dosya başarıyla **{dept_name}** bünyesine eklendi!")
+                    st.rerun()
 
-        # REVİZYON ÇAKIŞMASI ONAY BUTONLARI
+        # REVİZYON ONAYLARI
         if "pending_rev" in st.session_state and st.session_state["pending_rev"]["dept"] == dept_name:
             p = st.session_state["pending_rev"]
             st.error("Lütfen yapmak istediğiniz işlemi seçiniz:")
@@ -557,170 +530,154 @@ else:
             if col_rev1.button("🔄 EVET, Bu Bir Revizyondur (Eski Dosyayı Arşive Kaldır)"):
                 now_str = datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
                 old_info = p["old_row"]
-                old_file_id = old_info.get("Drive_File_ID", "")
-                old_file_name = old_info.get("Dosya Adı", "")
+                old_file_name = old_info.get("dosya_adi", "Yok")
                 
-                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                archived_fname = f"ARCHIVED_{timestamp}_{old_file_name}"
+                if old_file_name != "Yok":
+                    src_p = os.path.join(UPLOAD_DIR, old_file_name)
+                    if os.path.exists(src_p):
+                        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                        archived_fname = f"ARCHIVED_{timestamp}_{old_file_name}"
+                        dst_p = os.path.join(ARCHIVE_DIR, archived_fname)
+                        shutil.move(src_p, dst_p)
+                        archived_file_ref = archived_fname
+                    else:
+                        archived_file_ref = old_file_name
+                else:
+                    archived_file_ref = "Yok"
                 
-                if old_file_id and old_file_id != "None":
-                    move_drive_file(old_file_id, UPLOAD_FOLDER_ID, ARCHIVE_FOLDER_ID, archived_fname)
+                conn = get_db_connection()
+                cursor = conn.cursor()
                 
-                old_archive_rec = {
-                    "Tarih / Saat": old_info.get("Tarih / Saat", "-"),
-                    "Departman": dept_name,
-                    "Doküman No": old_info.get("Doküman No", "-"),
-                    "Doküman Adı": old_info.get("Doküman Adı", "-"),
-                    "Revizyon No": old_info.get("Revizyon No", "00"),
-                    "Açıklama / Not": old_info.get("Açıklama / Not", "-"),
-                    "Dosya Adı": archived_fname,
-                    "Ekleyen": old_info.get("Ekleyen", "-"),
-                    "Arşivlenme Tarihi": now_str,
-                    "Drive_File_ID": old_file_id
-                }
-                df_archive = pd.concat([pd.DataFrame([old_archive_rec]), df_archive], ignore_index=True)
-                save_data(df_archive, "Arsiv_Dokumanlari")
+                # Eski kaydı arşiv tablosuna aktar
+                cursor.execute('''
+                    INSERT INTO arsiv_dokumanlari 
+                    (tarih_saat, departman, dokuman_no, dokuman_adi, revizyon_no, aciklama_not, dosya_adi, ekleyen, arsivlenme_tarihi)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (old_info['tarih_saat'], dept_name, old_info['dokuman_no'], old_info['dokuman_adi'], old_info['revizyon_no'], old_info['aciklama_not'], archived_file_ref, old_info['ekleyen'], now_str))
                 
-                df_docs = df_docs[~((df_docs["Departman"] == dept_name) & (df_docs["Doküman No"] == p["doc_no"]))]
+                # Aktif tablodaki eski kaydı sil
+                cursor.execute("DELETE FROM departman_dokumanlari WHERE id=?", (old_info['id'],))
                 
+                # Yeni revize kaydı aktif tabloya ekle
                 _, ext = os.path.splitext(p["uploaded_file"].name)
                 new_standard_fname = generate_standard_filename(p["doc_no"], p["doc_title"], p["doc_rev"], ext)
-                new_file_id = upload_to_drive(p["uploaded_file"], new_standard_fname, UPLOAD_FOLDER_ID)
+                new_file_name = save_uploaded_file_standard(p["uploaded_file"], UPLOAD_DIR, new_standard_fname)
                 
-                new_rec = {
-                    "Tarih / Saat": now_str,
-                    "Departman": dept_name,
-                    "Doküman No": p["doc_no"],
-                    "Doküman Adı": p["doc_title"],
-                    "Revizyon No": p["doc_rev"],
-                    "Açıklama / Not": p["doc_note"],
-                    "Dosya Adı": new_standard_fname,
-                    "Ekleyen": st.session_state["username"],
-                    "Revizyon Mu": "Evet",
-                    "Drive_File_ID": new_file_id
-                }
-                df_docs = pd.concat([pd.DataFrame([new_rec]), df_docs], ignore_index=True)
-                save_data(df_docs, "Departman_Dokumanlari")
+                cursor.execute('''
+                    INSERT INTO departman_dokumanlari 
+                    (tarih_saat, departman, dokuman_no, dokuman_adi, revizyon_no, aciklama_not, dosya_adi, ekleyen, revizyon_mu)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Evet')
+                ''', (now_str, dept_name, p["doc_no"], p["doc_title"], p["doc_rev"], p["doc_note"], new_file_name, st.session_state["username"]))
+                
+                conn.commit()
+                conn.close()
                 
                 add_notification(st.session_state["username"], dept_name, f"REVİZYON YAPILDI: {p['doc_no']} - {p['doc_title']} (Rev: {p['doc_rev']})")
                 del st.session_state["pending_rev"]
-                st.success(f"✅ Revizyon başarıyla işlendi! Yeni dosya **{new_standard_fname}** olarak Google Drive'a yüklendi, eski versiyon arşive kaldırıldı.")
+                st.success(f"✅ Revizyon işlendi! Yeni dosya **{new_file_name}** aktifleşti.")
                 st.rerun()
 
             if col_rev2.button("📄 EVET, Farklı Bir Doküman Olarak Ekle"):
                 now_str = datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
-                
                 _, ext = os.path.splitext(p["uploaded_file"].name)
                 new_standard_fname = generate_standard_filename(p["doc_no"], p["doc_title"], p["doc_rev"], ext)
-                new_file_id = upload_to_drive(p["uploaded_file"], new_standard_fname, UPLOAD_FOLDER_ID)
+                new_file_name = save_uploaded_file_standard(p["uploaded_file"], UPLOAD_DIR, new_standard_fname)
                 
-                new_rec = {
-                    "Tarih / Saat": now_str,
-                    "Departman": dept_name,
-                    "Doküman No": p["doc_no"],
-                    "Doküman Adı": p["doc_title"],
-                    "Revizyon No": p["doc_rev"],
-                    "Açıklama / Not": p["doc_note"],
-                    "Dosya Adı": new_standard_fname,
-                    "Ekleyen": st.session_state["username"],
-                    "Revizyon Mu": "Hayır",
-                    "Drive_File_ID": new_file_id
-                }
-                
-                df_docs = pd.concat([pd.DataFrame([new_rec]), df_docs], ignore_index=True)
-                save_data(df_docs, "Departman_Dokumanlari")
+                conn = get_db_connection()
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT INTO departman_dokumanlari 
+                    (tarih_saat, departman, dokuman_no, dokuman_adi, revizyon_no, aciklama_not, dosya_adi, ekleyen, revizyon_mu)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Hayır')
+                ''', (now_str, dept_name, p["doc_no"], p["doc_title"], p["doc_rev"], p["doc_note"], new_file_name, st.session_state["username"]))
+                conn.commit()
+                conn.close()
                 
                 add_notification(st.session_state["username"], dept_name, f"Yeni Doküman Eklendi: {p['doc_no']} - {p['doc_title']} (Rev: {p['doc_rev']})")
                 del st.session_state["pending_rev"]
-                st.success(f"✅ Doküman başarıyla eklendi! Dosya adı: **{new_standard_fname}**")
+                st.success(f"✅ Doküman eklendi: **{new_file_name}**")
                 st.rerun()
 
             if col_rev3.button("❌ İŞLEMİ İPTAL ET"):
                 del st.session_state["pending_rev"]
                 st.info("İşlem iptal edildi.")
                 st.rerun()
-                
-        st.markdown("---")
 
-    # DEPARTMAN İÇİ CANLI HIZLI ARAMA ÇUBUĞU
-    dept_search = st.text_input(f"🔍 {dept_name} İçinde Hızlı Dosya Ara (Kod, Ad, Not)...", key=f"search_{dept_name}").strip().lower()
-
-    # AİT OLDUĞU DEPARTMANIN DOKÜMANLARINI SEKMELERLE LİSTELEME
+    # DEPARTMAN İÇİ LİSTELEME VE ARAMA
+    dept_search = st.text_input(f"🔍 {dept_name} İçinde Hızlı Dosya Ara...", key=f"search_{dept_name}").strip()
     tab1, tab2, tab3 = st.tabs(["📄 Aktif Dokümanlar", "🔄 Son Revizeler / Değişiklikler", "📁 Arşivlenen Eski Versiyonlar"])
-
-    if not df_docs.empty and "Departman" in df_docs.columns:
-        dept_active_docs = df_docs[df_docs["Departman"] == dept_name]
-    else:
-        dept_active_docs = pd.DataFrame()
-
-    if not df_archive.empty and "Departman" in df_archive.columns:
-        dept_archive_docs = df_archive[df_archive["Departman"] == dept_name]
-    else:
-        dept_archive_docs = pd.DataFrame()
 
     # TAB 1: AKTİF DOKÜMANLAR
     with tab1:
-        if not dept_active_docs.empty:
-            if dept_search:
-                filtered_active = dept_active_docs[
-                    dept_active_docs["Doküman Adı"].astype(str).str.lower().str.contains(dept_search) |
-                    dept_active_docs["Doküman No"].astype(str).str.lower().str.contains(dept_search) |
-                    dept_active_docs["Açıklama / Not"].astype(str).str.lower().str.contains(dept_search)
-                ]
-            else:
-                filtered_active = dept_active_docs
+        if dept_search:
+            q = "%" + dept_search + "%"
+            dept_active = get_df_from_query('''
+                SELECT tarih_saat AS "Tarih / Saat", dokuman_no AS "Doküman No", dokuman_adi AS "Doküman Adı", 
+                       revizyon_no AS "Revizyon No", aciklama_not AS "Açıklama / Not", dosya_adi AS "Dosya Adı", ekleyen AS "Ekleyen"
+                FROM departman_dokumanlari 
+                WHERE departman=? AND (dokuman_adi LIKE ? OR dokuman_no LIKE ? OR aciklama_not LIKE ?)
+                ORDER BY id DESC
+            ''', (dept_name, q, q, q))
+        else:
+            dept_active = get_df_from_query('''
+                SELECT tarih_saat AS "Tarih / Saat", dokuman_no AS "Doküman No", dokuman_adi AS "Doküman Adı", 
+                       revizyon_no AS "Revizyon No", aciklama_not AS "Açıklama / Not", dosya_adi AS "Dosya Adı", ekleyen AS "Ekleyen"
+                FROM departman_dokumanlari WHERE departman=? ORDER BY id DESC
+            ''', (dept_name,))
 
-            st.dataframe(filtered_active, use_container_width=True)
+        st.dataframe(dept_active, use_container_width=True)
 
-            for idx, row in filtered_active.iterrows():
-                file_id = row.get("Drive_File_ID", "")
-                f_name = row.get("Dosya Adı", "Yok")
-                if file_id and file_id != "None" and file_id != "":
+        for idx, row in dept_active.iterrows():
+            f_name = row.get("Dosya Adı", "Yok")
+            if f_name and f_name != "Yok":
+                f_path = os.path.join(UPLOAD_DIR, f_name)
+                if os.path.exists(f_path):
                     c1, c2 = st.columns([3, 1])
                     c1.write(f"📄 **[{row.get('Doküman No')}]** {row.get('Doküman Adı')} *(Rev: {row.get('Revizyon No')})*")
-                    try:
-                        file_bytes = download_from_drive(file_id)
-                        c2.download_button(label="📥 İndir", data=file_bytes, file_name=f_name, key=f"act_down_{idx}_{file_id}")
-                    except Exception:
-                        c2.caption("⚠️ İndirilemedi")
-        else:
-            st.info(f"{dept_name} departmanına ait kayıtlı aktif doküman bulunmuyor.")
+                    with open(f_path, "rb") as f:
+                        c2.download_button(label="📥 İndir", data=f, file_name=f_name, key=f"act_down_{idx}_{f_name}")
 
     # TAB 2: REVİZE EDİLENLER
     with tab2:
-        if not dept_active_docs.empty:
-            revised_docs = dept_active_docs[dept_active_docs["Revizyon Mu"] == "Evet"]
-            if not revised_docs.empty:
-                st.dataframe(revised_docs, use_container_width=True)
-            else:
-                st.info("Bu departmanda henüz revize edilmiş doküman bulunmamaktadır.")
+        dept_revised = get_df_from_query('''
+            SELECT tarih_saat AS "Tarih / Saat", dokuman_no AS "Doküman No", dokuman_adi AS "Doküman Adı", 
+                   revizyon_no AS "Revizyon No", aciklama_not AS "Açıklama / Not", dosya_adi AS "Dosya Adı", ekleyen AS "Ekleyen"
+            FROM departman_dokumanlari WHERE departman=? AND revizyon_mu='Evet' ORDER BY id DESC
+        ''', (dept_name,))
+        
+        if not dept_revised.empty:
+            st.dataframe(dept_revised, use_container_width=True)
         else:
-            st.info("Bu departmanda doküman bulunmuyor.")
+            st.info("Bu departmanda henüz revize edilmiş doküman bulunmamaktadır.")
 
     # TAB 3: ARŞİVLENEN ESKİ VERSİYONLAR
     with tab3:
-        if not dept_archive_docs.empty:
-            if dept_search:
-                filtered_arch_dept = dept_archive_docs[
-                    dept_archive_docs["Doküman Adı"].astype(str).str.lower().str.contains(dept_search) |
-                    dept_archive_docs["Doküman No"].astype(str).str.lower().str.contains(dept_search) |
-                    dept_archive_docs["Açıklama / Not"].astype(str).str.lower().str.contains(dept_search)
-                ]
-            else:
-                filtered_arch_dept = dept_archive_docs
+        if dept_search:
+            q = "%" + dept_search + "%"
+            dept_archive = get_df_from_query('''
+                SELECT tarih_saat AS "Tarih / Saat", dokuman_no AS "Doküman No", dokuman_adi AS "Doküman Adı", 
+                       revizyon_no AS "Revizyon No", aciklama_not AS "Açıklama / Not", dosya_adi AS "Dosya Adı", 
+                       ekleyen AS "Ekleyen", arsivlenme_tarihi AS "Arşivlenme Tarihi"
+                FROM arsiv_dokumanlari 
+                WHERE departman=? AND (dokuman_adi LIKE ? OR dokuman_no LIKE ? OR aciklama_not LIKE ?)
+                ORDER BY id DESC
+            ''', (dept_name, q, q, q))
+        else:
+            dept_archive = get_df_from_query('''
+                SELECT tarih_saat AS "Tarih / Saat", dokuman_no AS "Doküman No", dokuman_adi AS "Doküman Adı", 
+                       revizyon_no AS "Revizyon No", aciklama_not AS "Açıklama / Not", dosya_adi AS "Dosya Adı", 
+                       ekleyen AS "Ekleyen", arsivlenme_tarihi AS "Arşivlenme Tarihi"
+                FROM arsiv_dokumanlari WHERE departman=? ORDER BY id DESC
+            ''', (dept_name,))
 
-            st.dataframe(filtered_arch_dept, use_container_width=True)
+        st.dataframe(dept_archive, use_container_width=True)
 
-            for idx, row in filtered_arch_dept.iterrows():
-                file_id = row.get("Drive_File_ID", "")
-                f_name = row.get("Dosya Adı", "Yok")
-                if file_id and file_id != "None" and file_id != "":
+        for idx, row in dept_archive.iterrows():
+            f_name = row.get("Dosya Adı", "Yok")
+            if f_name and f_name != "Yok":
+                f_path = os.path.join(ARCHIVE_DIR, f_name)
+                if os.path.exists(f_path):
                     c1, c2 = st.columns([3, 1])
                     c1.write(f"📁 **[{row.get('Doküman No')}]** {row.get('Doküman Adı')} *(Eski Rev: {row.get('Revizyon No')})* - Arşiv Tarihi: {row.get('Arşivlenme Tarihi')}")
-                    try:
-                        file_bytes = download_from_drive(file_id)
-                        c2.download_button(label="📥 Eski Versiyonu İndir", data=file_bytes, file_name=f_name, key=f"arch_down_{idx}_{file_id}")
-                    except Exception:
-                        c2.caption("⚠️ İndirilemedi")
-        else:
-            st.info(f"{dept_name} departmanına ait arşivlenmiş eski doküman bulunmuyor.")
+                    with open(f_path, "rb") as f:
+                        c2.download_button(label="📥 Eski Versiyonu İndir", data=f, file_name=f_name, key=f"arch_down_{idx}_{f_name}")
