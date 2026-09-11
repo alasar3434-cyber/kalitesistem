@@ -5,6 +5,7 @@ import os
 import re
 import zipfile
 import io
+import shutil
 import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -23,7 +24,8 @@ DRIVE_FOLDER_ID = "1hU-W47HVtFHb-if_BMEbw17He3b8mak9"  # App_Dokumanlar Klasör 
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive"
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/drive.file"
 ]
 
 @st.cache_resource
@@ -113,10 +115,15 @@ def upload_to_google_drive(file_bytes, filename, mime_type="application/octet-st
             'parents': [DRIVE_FOLDER_ID]
         }
         media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=mime_type, resumable=True)
-        file = service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
+        file = service.files().create(
+            body=file_metadata, 
+            media_body=media, 
+            fields='id, webViewLink',
+            supportsAllDrives=True
+        ).execute()
         return file.get('webViewLink', '-')
     except Exception as e:
-        st.error(f"Google Drive'a yüklenirken hata oluştu: {e}")
+        st.error(f"⚠️ Google Drive'a Yükleme Hatası Detayı: {e}")
         return "-"
 
 # --- DOSYA VE KLASÖR YOLLARI ---
@@ -486,7 +493,7 @@ else:
                         # 1. Yerel Kaydet
                         file_name = save_uploaded_file_standard(uploaded_file, UPLOAD_DIR, standard_fname)
                         # 2. Google Drive Yükle
-                        drive_link = upload_to_google_drive(file_bytes, standard_fname)
+                        drive_link = upload_to_google_drive(file_bytes, standard_fname, uploaded_file.type)
                         
                         now_str = datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
                         
@@ -505,7 +512,7 @@ else:
                         df_docs = pd.concat([pd.DataFrame([new_rec]), df_docs], ignore_index=True)
                         save_data(df_docs, "Departman_Dokumanlari")
                         add_notification(st.session_state["full_name"], dept_name, f"Yeni Doküman Eklendi: {doc_no} - {doc_title} (Rev: {doc_rev})")
-                        st.success(f"✅ `{doc_no}` numaralı yeni doküman Google Drive ve Sheets'e eklendi: **{file_name}**")
+                        st.success(f"✅ `{doc_no}` numaralı yeni doküman eklendi: **{file_name}**")
                         st.rerun()
 
         elif upload_mode == "📁 Toplu Çoklu Dosya Yükleme":
@@ -557,7 +564,7 @@ else:
                             f_bytes = item["file_obj"].getvalue()
                             
                             saved_fname = save_uploaded_file_standard(item["file_obj"], UPLOAD_DIR, standard_fname)
-                            d_link = upload_to_google_drive(f_bytes, standard_fname)
+                            d_link = upload_to_google_drive(f_bytes, standard_fname, item["file_obj"].type)
                             
                             new_rec = {
                                 "Tarih / Saat": now_str,
@@ -576,7 +583,7 @@ else:
                         
                         save_data(df_docs, "Departman_Dokumanlari")
                         add_notification(st.session_state["full_name"], dept_name, f"Toplu Yükleme Yapıldı: {success_count} adet doküman eklendi.")
-                        st.success(f"🎉 **{success_count}** adet dosya başarıyla **{dept_name}** bünyesine ve Google Drive'a eklendi!")
+                        st.success(f"🎉 **{success_count}** adet dosya başarıyla **{dept_name}** bünyesine eklendi!")
                         st.rerun()
 
         # REVİZYON ÇAKIŞMASI ONAY BUTONLARI
@@ -624,7 +631,6 @@ else:
                 _, ext = os.path.splitext(p["uploaded_file_name"])
                 new_standard_fname = generate_standard_filename(p["doc_no"], p["doc_title"], p["doc_rev"], ext)
                 
-                # Dosyayı hem yerel klösöre hem de Drive'a aktar
                 file_path = os.path.join(UPLOAD_DIR, new_standard_fname)
                 with open(file_path, "wb") as f:
                     f.write(p["uploaded_file_bytes"])
@@ -648,7 +654,7 @@ else:
                 
                 add_notification(st.session_state["full_name"], dept_name, f"REVİZYON YAPILDI: {p['doc_no']} - {p['doc_title']} (Rev: {p['doc_rev']})")
                 del st.session_state["pending_rev"]
-                st.success(f"✅ Revizyon işlendi! Yeni dosya **{new_standard_fname}** canlıya alındı, Google Drive ve Sheets arşiv güncellendi.")
+                st.success(f"✅ Revizyon işlendi! Yeni dosya **{new_standard_fname}** canlıya alındı.")
                 st.rerun()
 
             if col_rev2.button("📄 EVET, Farklı Bir Doküman Olarak Ekle"):
