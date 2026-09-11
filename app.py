@@ -3,140 +3,85 @@ import pandas as pd
 import datetime
 import os
 import json
-import shutil
 import re
-import zipfile
 import io
 
-# --- 1. ÇALIŞMA DİZİNİ GÜVENLİK KİLİDİ (VERİ KAYBINI ENGELLEMEK İÇİN) ---
-# Kod dosyasının bulunduğu dizin kesin olarak alınır ve çalışma dizini oraya sabitlenir.
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-os.chdir(BASE_DIR)
+import gspread
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 
 # --- SAYFA AYARLARI ---
 st.set_page_config(page_title="ALASAR GRUP - Kalite Yönetim Sistemi", page_icon="🛡️", layout="wide")
 
-# --- DOSYA VE KLASÖR YOLLARI ---
-EXCEL_FILE = os.path.join(BASE_DIR, "alasar_kalite_vt.xlsx")
-USERS_FILE = os.path.join(BASE_DIR, "users.json")
-UPLOAD_DIR = os.path.join(BASE_DIR, "yuklenen_belgeler")
-ARCHIVE_DIR = os.path.join(BASE_DIR, "arsivlenenler")
+# --- GOOGLE API & CREDENTIALS BAĞLANTISI ---
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
 
-for d in [UPLOAD_DIR, ARCHIVE_DIR]:
-    if not os.path.exists(d):
-        os.makedirs(d)
-
-# --- DOSYA ADI TEMİZLEME VE STANDARTLAŞTIRMA YARDIMCI FONKSİYONLARI ---
-def clean_filename_part(text):
-    """Dosya adlarında geçersiz karakterleri temizler ve standartlaştırır."""
-    if not text:
-        return ""
-    text_str = str(text).strip()
-    tr_map = str.maketrans("çğıöşüÇĞİÖŞÜ", "cgiosuCGIOSU")
-    clean_str = text_str.translate(tr_map)
-    clean_str = re.sub(r'[\\/*?:"<>|]', "", clean_str)
-    clean_str = re.sub(r'\s+', "_", clean_str)
-    clean_str = re.sub(r'_+', "_", clean_str)
-    return clean_str
-
-def generate_standard_filename(doc_no, doc_title, rev_no, file_extension):
-    """
-    Panel verilerine göre standart dosya adı oluşturur:
-    Format: [DOKUMAN_NO]_[DOKUMAN_ADI]_R[REV_NO].[uzanti]
-    """
-    clean_no = clean_filename_part(doc_no)
-    clean_title = clean_filename_part(doc_title)
-    
+@st.cache_resource
+def get_google_services():
+    """Google Sheets ve Drive servislerine Secrets üzerinden güvenli erişim sağlar."""
     try:
-        rev_int = int(str(rev_no).strip())
-        formatted_rev = f"{rev_int:02d}"
-    except (ValueError, TypeError):
-        formatted_rev = str(rev_no).strip()
+        creds_dict = dict(st.secrets["gcp_service_account"])
+        creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
         
-    ext = file_extension if file_extension.startswith(".") else f".{file_extension}"
-    return f"{clean_no}_{clean_title}_R{formatted_rev}{ext}"
+        # gspread Client
+        gc = gspread.authorize(creds)
+        
+        # Drive API Service
+        drive_service = build('drive', 'v3', credentials=creds)
+        
+        return gc, drive_service
+    except Exception as e:
+        st.error(f"Google servislerine bağlanırken hata oluştu: {e}")
+        st.stop()
 
-def save_uploaded_file_standard(uploaded_file, target_dir, target_filename):
-    """Yüklenen dosyayı orijinal adını yoksayarak verilen hedef adla kaydeder."""
-    if uploaded_file is not None:
-        file_path = os.path.join(target_dir, target_filename)
-        with open(file_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-        return target_filename
-    return "Yok"
+gc, drive_service = get_google_services()
 
-# --- TOPLU SIKIŞTIRMA (ZIP) YARDIMCI FONKSİYONU ---
-def create_system_zip():
-    """Yüklenen ve arşivlenen tüm fiziksel dosyaları bellekte ZIP dosyası haline getirir."""
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-        for folder in [UPLOAD_DIR, ARCHIVE_DIR]:
-            if os.path.exists(folder):
-                for root, _, files in os.walk(folder):
-                    for file in files:
-                        file_path = os.path.join(root, file)
-                        arcname = os.path.join(os.path.basename(folder), file)
-                        zip_file.write(file_path, arcname)
-    zip_buffer.seek(0)
-    return zip_buffer
+# --- GOOGLE SHEETS VERİ TABANI AYARLARI ---
+SPREADSHEET_NAME = "Alasar_Kalite_VT"
 
-# --- VARSAYILAN KULLANICI LİSTESİ VE ŞİFRELER ---
-DEFAULT_USERS = {
-    "Mehmet Alaşar": {"password": "malsr3434.", "role": "Yönetici", "can_edit": False},
-    "Dilber Alaşar": {"password": "dalsr4141.", "role": "Yönetici", "can_edit": True},
-    "Nilay Kiraz": {"password": "nkrz5151.", "role": "İK", "can_edit": False},
-    "Ömer OCAK": {"password": "oock6161.", "role": "Kalite Sistem Mühendisi", "can_edit": True}
-}
+@st.cache_resource
+def get_or_create_spreadsheet():
+    """Google Sheets dosyasını kontrol eder, yoksa oluşturur ve yapılandırır."""
+    try:
+        sh = gc.open(SPREADSHEET_NAME)
+    except gspread.exceptions.SpreadsheetNotFound:
+        sh = gc.create(SPREADSHEET_NAME)
+        # Varsayılan sayfalar
+        ws1 = sh.sheet1
+        ws1.update_title("Departman_Dokumanlari")
+        ws1.append_row(["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Ekleyen", "Revizyon Mu", "Drive_File_ID"])
+        
+        ws2 = sh.add_worksheet(title="Arsiv_Dokumanlari", rows=100, cols=20)
+        ws2.append_row(["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Ekleyen", "Arşivlenme Tarihi", "Drive_File_ID"])
+        
+        ws3 = sh.add_worksheet(title="Bildirimler", rows=100, cols=10)
+        ws3.append_row(["Tarih / Saat", "İşlemi Yapan", "Departman / Modül", "Detay / Doküman"])
+    return sh
 
-# --- KULLANICI VERİLERİNİ YÜKLEME / KAYDETME ---
-def load_users():
-    if os.path.exists(USERS_FILE):
-        try:
-            with open(USERS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return DEFAULT_USERS
-    else:
-        save_users(DEFAULT_USERS)
-        return DEFAULT_USERS
-
-def save_users(users_dict):
-    with open(USERS_FILE, "w", encoding="utf-8") as f:
-        json.dump(users_dict, f, ensure_ascii=False, indent=4)
-
-USERS = load_users()
-
-# --- GÜVENLİ VERİ TABANI OKUMA VE KAYDETME SİSTEMİ ---
-def init_excel_db():
-    """Excel veritabanı yoksa ilk kez oluşturur."""
-    if not os.path.exists(EXCEL_FILE):
-        with pd.ExcelWriter(EXCEL_FILE, engine='openpyxl') as writer:
-            pd.DataFrame(columns=["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Ekleyen", "Revizyon Mu"]).to_excel(writer, sheet_name="Departman_Dokumanlari", index=False)
-            pd.DataFrame(columns=["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Ekleyen", "Arşivlenme Tarihi"]).to_excel(writer, sheet_name="Arsiv_Dokumanlari", index=False)
-            pd.DataFrame(columns=["Tarih / Saat", "İşlemi Yapan", "Departman / Modül", "Detay / Doküman"]).to_excel(writer, sheet_name="Bildirimler", index=False)
+spreadsheet = get_or_create_spreadsheet()
 
 def load_data(sheet_name):
-    init_excel_db()
+    """Google Sheets üzerinden verileri Pandas DataFrame olarak çeker."""
     try:
-        df = pd.read_excel(EXCEL_FILE, sheet_name=sheet_name)
-        if sheet_name == "Departman_Dokumanlari":
-            expected_cols = ["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Ekleyen", "Revizyon Mu"]
-            for col in expected_cols:
-                if col not in df.columns:
-                    df[col] = "Hayır" if col == "Revizyon Mu" else ("00" if col == "Revizyon No" else "-")
-        elif sheet_name == "Arsiv_Dokumanlari":
-            expected_cols = ["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Ekleyen", "Arşivlenme Tarihi"]
-            for col in expected_cols:
-                if col not in df.columns:
-                    df[col] = "-"
+        worksheet = spreadsheet.worksheet(sheet_name)
+        data = worksheet.get_all_records()
+        df = pd.DataFrame(data)
         return df
-    except Exception:
+    except Exception as e:
         return pd.DataFrame()
 
-def save_data(df_new, sheet_name):
-    init_excel_db()
-    with pd.ExcelWriter(EXCEL_FILE, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
-        df_new.to_excel(writer, sheet_name=sheet_name, index=False)
+def save_data(df, sheet_name):
+    """Pandas DataFrame verisini Google Sheets tablosuna yazar."""
+    try:
+        worksheet = spreadsheet.worksheet(sheet_name)
+        worksheet.clear()
+        worksheet.update([df.columns.values.tolist()] + df.astype(str).values.tolist())
+    except Exception as e:
+        st.error(f"Veri kaydedilirken hata oluştu ({sheet_name}): {e}")
 
 def add_notification(user, modul, detail):
     df_notif = load_data("Bildirimler")
@@ -149,6 +94,113 @@ def add_notification(user, modul, detail):
     }
     df_notif = pd.concat([pd.DataFrame([new_notif]), df_notif], ignore_index=True)
     save_data(df_notif, "Bildirimler")
+
+# --- GOOGLE DRIVE KLASÖR VE DOSYA YÖNETİMİ ---
+@st.cache_data
+def get_or_create_drive_folder(folder_name, parent_id=None):
+    """Drive üzerinde klasör arar, yoksa yeni oluşturur."""
+    query = f"mimeType='application/vnd.google-apps.folder' and name='{folder_name}' and trashed=false"
+    if parent_id:
+        query += f" and '{parent_id}' in parents"
+    
+    results = drive_service.files().list(q=query, fields="files(id, name)").execute()
+    items = results.get('files', [])
+    
+    if items:
+        return items[0]['id']
+    else:
+        file_metadata = {
+            'name': folder_name,
+            'mimeType': 'application/vnd.google-apps.folder'
+        }
+        if parent_id:
+            file_metadata['parents'] = [parent_id]
+        folder = drive_service.files().create(body=file_metadata, fields='id').execute()
+        return folder.get('id')
+
+UPLOAD_FOLDER_ID = get_or_create_drive_folder("YUKLENEN_BELGELER")
+ARCHIVE_FOLDER_ID = get_or_create_drive_folder("ARSIVLENENLER")
+
+def upload_to_drive(uploaded_file, file_name, folder_id):
+    """Streamlit file_uploader dosyasını doğrudan Google Drive'a yükler."""
+    file_metadata = {
+        'name': file_name,
+        'parents': [folder_id]
+    }
+    media = MediaIoBaseUpload(io.BytesIO(uploaded_file.getbuffer()), mimetype=uploaded_file.type, resumable=True)
+    file = drive_service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink, webContentLink').execute()
+    return file.get('id')
+
+def move_drive_file(file_id, from_folder_id, to_folder_id, new_name=None):
+    """Drive üzerindeki bir dosyayı klasörler arası taşır (Arşivleme için)."""
+    try:
+        file = drive_service.files().get(fileId=file_id, fields='parents').execute()
+        previous_parents = ",".join(file.get('parents', []))
+        
+        body = {}
+        if new_name:
+            body['name'] = new_name
+            
+        drive_service.files().update(
+            fileId=file_id,
+            addParents=to_folder_id,
+            removeParents=previous_parents,
+            body=body,
+            fields='id, parents'
+        ).execute()
+        return True
+    except Exception as e:
+        st.error(f"Drive dosya taşıma hatası: {e}")
+        return False
+
+def download_from_drive(file_id):
+    """Drive üzerindeki dosyayı indirmek için bayt nesnesi döner."""
+    request = drive_service.files().get_media(fileId=file_id)
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, request)
+    done = False
+    while done is False:
+        status, done = downloader.next_chunk()
+    fh.seek(0)
+    return fh.read()
+
+# --- DOSYA ADI TEMİZLEME VE STANDARTLAŞTIRMA YARDIMCI FONKSİYONLARI ---
+def clean_filename_part(text):
+    if not text:
+        return ""
+    text_str = str(text).strip()
+    tr_map = str.maketrans("çğıöşüÇĞİÖŞÜ", "cgiosuCGIOSU")
+    clean_str = text_str.translate(tr_map)
+    clean_str = re.sub(r'[\\/*?:"<>|]', "", clean_str)
+    clean_str = re.sub(r'\s+', "_", clean_str)
+    clean_str = re.sub(r'_+', "_", clean_str)
+    return clean_str
+
+def generate_standard_filename(doc_no, doc_title, rev_no, file_extension):
+    clean_no = clean_filename_part(doc_no)
+    clean_title = clean_filename_part(doc_title)
+    
+    try:
+        rev_int = int(str(rev_no).strip())
+        formatted_rev = f"{rev_int:02d}"
+    except (ValueError, TypeError):
+        formatted_rev = str(rev_no).strip()
+        
+    ext = file_extension if file_extension.startswith(".") else f".{file_extension}"
+    return f"{clean_no}_{clean_title}_R{formatted_rev}{ext}"
+
+# --- KULLANICI LİSTESİ VE ŞİFRELER ---
+DEFAULT_USERS = {
+    "Mehmet Alaşar": {"password": "malsr3434.", "role": "Yönetici", "can_edit": False},
+    "Dilber Alaşar": {"password": "dalsr4141.", "role": "Yönetici", "can_edit": True},
+    "Nilay Kiraz": {"password": "nkrz5151.", "role": "İK", "can_edit": False},
+    "Ömer OCAK": {"password": "oock6161.", "role": "Kalite Sistem Mühendisi", "can_edit": True}
+}
+
+if "users" not in st.session_state:
+    st.session_state["users"] = DEFAULT_USERS
+
+USERS = st.session_state["users"]
 
 # --- OTURUM DURUMU ---
 if "logged_in" not in st.session_state:
@@ -205,17 +257,6 @@ if st.sidebar.button("🚪 Çıkış Yap"):
 
 st.sidebar.markdown("---")
 
-if os.path.exists(EXCEL_FILE):
-    with open(EXCEL_FILE, "rb") as file:
-        st.sidebar.download_button(
-            label="📥 Excel Veri Tabanını İndir",
-            data=file,
-            file_name=f"Alasar_Kalite_VT_{datetime.date.today()}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-
-st.sidebar.markdown("---")
-
 menu_options = [
     "🔍 GENEL ARAMA MERKEZİ",
     "👥 İNSAN KAYNAKLARI DEPARTMANI",
@@ -252,7 +293,7 @@ with st.sidebar.expander("🔑 Şifremi Değiştir"):
                 st.error("Şifre en az 4 karakter olmalıdır!")
             else:
                 USERS[current_user]["password"] = new_pass
-                save_users(USERS)
+                st.session_state["users"] = USERS
                 st.success("Şifreniz başarıyla değiştirildi!")
 
 # --- CANLI BİLDİRİM PANELİ ---
@@ -294,14 +335,16 @@ if modul == "🔍 GENEL ARAMA MERKEZİ":
             st.dataframe(filtered_df, use_container_width=True)
 
             for idx, row in filtered_df.iterrows():
+                file_id = row.get("Drive_File_ID", "")
                 f_name = row.get("Dosya Adı", "Yok")
-                if f_name and f_name != "Yok":
-                    f_path = os.path.join(UPLOAD_DIR, f_name)
-                    if os.path.exists(f_path):
-                        c1, c2 = st.columns([3, 1])
-                        c1.write(f"📄 **[{row.get('Departman')}]** - **[{row.get('Doküman No')}]** {row.get('Doküman Adı')} *(Rev: {row.get('Revizyon No')})*")
-                        with open(f_path, "rb") as f:
-                            c2.download_button(label="📥 İndir", data=f, file_name=f_name, key=f"glob_act_{idx}_{f_name}")
+                if file_id and file_id != "None" and file_id != "":
+                    c1, c2 = st.columns([3, 1])
+                    c1.write(f"📄 **[{row.get('Departman')}]** - **[{row.get('Doküman No')}]** {row.get('Doküman Adı')} *(Rev: {row.get('Revizyon No')})*")
+                    try:
+                        file_bytes = download_from_drive(file_id)
+                        c2.download_button(label="📥 İndir", data=file_bytes, file_name=f_name, key=f"glob_act_{idx}_{file_id}")
+                    except Exception:
+                        c2.caption("⚠️ İndirilemedi")
         else:
             st.info("Sistemde henüz aktif doküman bulunmuyor.")
 
@@ -322,14 +365,16 @@ if modul == "🔍 GENEL ARAMA MERKEZİ":
             st.dataframe(filtered_arch, use_container_width=True)
 
             for idx, row in filtered_arch.iterrows():
+                file_id = row.get("Drive_File_ID", "")
                 f_name = row.get("Dosya Adı", "Yok")
-                if f_name and f_name != "Yok":
-                    f_path = os.path.join(ARCHIVE_DIR, f_name)
-                    if os.path.exists(f_path):
-                        c1, c2 = st.columns([3, 1])
-                        c1.write(f"📁 **[{row.get('Departman')}]** - **[{row.get('Doküman No')}]** {row.get('Doküman Adı')} *(Rev: {row.get('Revizyon No')})* - Arşiv: {row.get('Arşivlenme Tarihi')}")
-                        with open(f_path, "rb") as f:
-                            c2.download_button(label="📥 Eski Versiyonu İndir", data=f, file_name=f_name, key=f"glob_arch_{idx}_{f_name}")
+                if file_id and file_id != "None" and file_id != "":
+                    c1, c2 = st.columns([3, 1])
+                    c1.write(f"📁 **[{row.get('Departman')}]** - **[{row.get('Doküman No')}]** {row.get('Doküman Adı')} *(Rev: {row.get('Revizyon No')})* - Arşiv: {row.get('Arşivlenme Tarihi')}")
+                    try:
+                        file_bytes = download_from_drive(file_id)
+                        c2.download_button(label="📥 Eski Versiyonu İndir", data=file_bytes, file_name=f_name, key=f"glob_arch_{idx}_{file_id}")
+                    except Exception:
+                        c2.caption("⚠️ İndirilemedi")
         else:
             st.info("Sistemde henüz arşivlenmiş doküman bulunmuyor.")
 
@@ -338,41 +383,19 @@ elif modul == "⚙️ SİSTEM YÖNETİMİ & BAKIŞ":
     st.title("⚙️ Sistem Yönetimi ve Toplu İşlem Paneli")
     st.warning("⚠️ Bu panel sadece **Ömer OCAK** tarafından görüntülenebilir ve yetkilendirilmiştir.")
 
-    st.markdown("### 📦 1. Tüm Belgeleri Toplu İndir (ZIP)")
-    st.write("Sistemde yuklenen tüm aktif ve arşivlenmiş dokümanları tek bir arşiv dosyası (.zip) olarak indirebilirsiniz.")
-    
-    zip_data = create_system_zip()
-    st.download_button(
-        label="📦 Tüm Sistem Dosyalarını İndir (.ZIP)",
-        data=zip_data,
-        file_name=f"Alasar_Tum_Sistem_Belgeleri_{datetime.date.today()}.zip",
-        mime="application/zip",
-        key="btn_zip_all"
-    )
-
-    st.markdown("---")
-    st.markdown("### 🧹 2. Sistem Temizleme ve Tam Sıfırlama")
-    st.error("🚨 **DİKKAT:** Bu işlem sistemdeki yüklü tüm dosyaları, arşiv klasörünü ve Excel veri tabanındaki tüm kayıtları kalıcı olarak siler!")
+    st.markdown("### 🧹 Sistem Temizleme ve Tam Sıfırlama")
+    st.error("🚨 **DİKKAT:** Bu işlem Google Sheets üzerindeki tüm kayıtları ve Drive üzerindeki referansları temizler!")
     
     confirm_check = st.checkbox("Sistemdeki tüm belgeleri ve veri tabanı kayıtlarını silmek istediğimi onaylıyorum.")
     
     if st.button("🔴 SİSTEMİ VE TÜM BELGELERİ TEMİZLE", disabled=not confirm_check):
-        for folder in [UPLOAD_DIR, ARCHIVE_DIR]:
-            if os.path.exists(folder):
-                for filename in os.listdir(folder):
-                    file_path = os.path.join(folder, filename)
-                    try:
-                        if os.path.isfile(file_path) or os.path.islink(file_path):
-                            os.unlink(file_path)
-                        elif os.path.isdir(file_path):
-                            shutil.rmtree(file_path)
-                    except Exception as e:
-                        st.error(f"Dosya silinirken hata oluştu: {file_path} - {e}")
+        empty_dept = pd.DataFrame(columns=["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Ekleyen", "Revizyon Mu", "Drive_File_ID"])
+        empty_arch = pd.DataFrame(columns=["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Ekleyen", "Arşivlenme Tarihi", "Drive_File_ID"])
+        empty_notif = pd.DataFrame(columns=["Tarih / Saat", "İşlemi Yapan", "Departman / Modül", "Detay / Doküman"])
         
-        with pd.ExcelWriter(EXCEL_FILE, engine='openpyxl') as writer:
-            pd.DataFrame(columns=["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Ekleyen", "Revizyon Mu"]).to_excel(writer, sheet_name="Departman_Dokumanlari", index=False)
-            pd.DataFrame(columns=["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Ekleyen", "Arşivlenme Tarihi"]).to_excel(writer, sheet_name="Arsiv_Dokumanlari", index=False)
-            pd.DataFrame(columns=["Tarih / Saat", "İşlemi Yapan", "Departman / Modül", "Detay / Doküman"]).to_excel(writer, sheet_name="Bildirimler", index=False)
+        save_data(empty_dept, "Departman_Dokumanlari")
+        save_data(empty_arch, "Arsiv_Dokumanlari")
+        save_data(empty_notif, "Bildirimler")
 
         add_notification("Ömer OCAK", "Sistem Yönetimi", "Tüm sistem belgeleri ve veri tabanı kayıtları sıfırlandı.")
         st.success("✅ Tüm sistem belgeleri ve veri tabanı başarıyla temizlendi!")
@@ -415,7 +438,7 @@ else:
                 if not doc_no or not doc_title or uploaded_file is None:
                     st.error("Lütfen Doküman Numarası, Doküman Adı giriniz ve bir dosya seçiniz.")
                 else:
-                    existing = df_docs[(df_docs["Departman"] == dept_name) & (df_docs["Doküman No"] == doc_no)]
+                    existing = df_docs[(df_docs["Departman"] == dept_name) & (df_docs["Doküman No"] == doc_no)] if not df_docs.empty else pd.DataFrame()
                     
                     if not existing.empty:
                         old_row = existing.iloc[0]
@@ -434,8 +457,8 @@ else:
                     else:
                         _, ext = os.path.splitext(uploaded_file.name)
                         standard_fname = generate_standard_filename(doc_no, doc_title, doc_rev, ext)
-                        file_name = save_uploaded_file_standard(uploaded_file, UPLOAD_DIR, standard_fname)
                         
+                        file_id = upload_to_drive(uploaded_file, standard_fname, UPLOAD_FOLDER_ID)
                         now_str = datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
                         
                         new_rec = {
@@ -445,14 +468,15 @@ else:
                             "Doküman Adı": doc_title,
                             "Revizyon No": doc_rev,
                             "Açıklama / Not": doc_note,
-                            "Dosya Adı": file_name,
+                            "Dosya Adı": standard_fname,
                             "Ekleyen": st.session_state["username"],
-                            "Revizyon Mu": "Hayır"
+                            "Revizyon Mu": "Hayır",
+                            "Drive_File_ID": file_id
                         }
                         df_docs = pd.concat([pd.DataFrame([new_rec]), df_docs], ignore_index=True)
                         save_data(df_docs, "Departman_Dokumanlari")
                         add_notification(st.session_state["username"], dept_name, f"Yeni Doküman Eklendi: {doc_no} - {doc_title} (Rev: {doc_rev})")
-                        st.success(f"✅ `{doc_no}` numaralı yeni doküman panel bilgileriyle başarıyla yüklendi: **{file_name}**")
+                        st.success(f"✅ `{doc_no}` numaralı yeni doküman Google Drive ve Sheets'e kaydedildi: **{standard_fname}**")
                         st.rerun()
 
         elif upload_mode == "📁 Toplu Çoklu Dosya Yükleme":
@@ -501,7 +525,7 @@ else:
                         
                         for item in bulk_data:
                             standard_fname = generate_standard_filename(item["doc_no"], item["doc_title"], item["doc_rev"], item["ext"])
-                            saved_fname = save_uploaded_file_standard(item["file_obj"], UPLOAD_DIR, standard_fname)
+                            file_id = upload_to_drive(item["file_obj"], standard_fname, UPLOAD_FOLDER_ID)
                             
                             new_rec = {
                                 "Tarih / Saat": now_str,
@@ -510,16 +534,17 @@ else:
                                 "Doküman Adı": item["doc_title"],
                                 "Revizyon No": item["doc_rev"],
                                 "Açıklama / Not": default_note,
-                                "Dosya Adı": saved_fname,
+                                "Dosya Adı": standard_fname,
                                 "Ekleyen": st.session_state["username"],
-                                "Revizyon Mu": "Hayır"
+                                "Revizyon Mu": "Hayır",
+                                "Drive_File_ID": file_id
                             }
                             df_docs = pd.concat([pd.DataFrame([new_rec]), df_docs], ignore_index=True)
                             success_count += 1
                         
                         save_data(df_docs, "Departman_Dokumanlari")
                         add_notification(st.session_state["username"], dept_name, f"Toplu Yükleme Yapıldı: {success_count} adet doküman eklendi.")
-                        st.success(f"🎉 **{success_count}** adet dosya başarıyla **{dept_name}** bünyesine eklendi!")
+                        st.success(f"🎉 **{success_count}** adet dosya başarıyla Google Drive'a yüklendi!")
                         st.rerun()
 
         # REVİZYON ÇAKIŞMASI ONAY BUTONLARI
@@ -532,20 +557,14 @@ else:
             if col_rev1.button("🔄 EVET, Bu Bir Revizyondur (Eski Dosyayı Arşive Kaldır)"):
                 now_str = datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
                 old_info = p["old_row"]
-                old_file_name = old_info.get("Dosya Adı", "Yok")
+                old_file_id = old_info.get("Drive_File_ID", "")
+                old_file_name = old_info.get("Dosya Adı", "")
                 
-                if old_file_name != "Yok":
-                    src_p = os.path.join(UPLOAD_DIR, old_file_name)
-                    if os.path.exists(src_p):
-                        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                        archived_fname = f"ARCHIVED_{timestamp}_{old_file_name}"
-                        dst_p = os.path.join(ARCHIVE_DIR, archived_fname)
-                        shutil.move(src_p, dst_p)
-                        archived_file_ref = archived_fname
-                    else:
-                        archived_file_ref = old_file_name
-                else:
-                    archived_file_ref = "Yok"
+                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                archived_fname = f"ARCHIVED_{timestamp}_{old_file_name}"
+                
+                if old_file_id and old_file_id != "None":
+                    move_drive_file(old_file_id, UPLOAD_FOLDER_ID, ARCHIVE_FOLDER_ID, archived_fname)
                 
                 old_archive_rec = {
                     "Tarih / Saat": old_info.get("Tarih / Saat", "-"),
@@ -554,9 +573,10 @@ else:
                     "Doküman Adı": old_info.get("Doküman Adı", "-"),
                     "Revizyon No": old_info.get("Revizyon No", "00"),
                     "Açıklama / Not": old_info.get("Açıklama / Not", "-"),
-                    "Dosya Adı": archived_file_ref,
+                    "Dosya Adı": archived_fname,
                     "Ekleyen": old_info.get("Ekleyen", "-"),
-                    "Arşivlenme Tarihi": now_str
+                    "Arşivlenme Tarihi": now_str,
+                    "Drive_File_ID": old_file_id
                 }
                 df_archive = pd.concat([pd.DataFrame([old_archive_rec]), df_archive], ignore_index=True)
                 save_data(df_archive, "Arsiv_Dokumanlari")
@@ -565,7 +585,7 @@ else:
                 
                 _, ext = os.path.splitext(p["uploaded_file"].name)
                 new_standard_fname = generate_standard_filename(p["doc_no"], p["doc_title"], p["doc_rev"], ext)
-                new_file_name = save_uploaded_file_standard(p["uploaded_file"], UPLOAD_DIR, new_standard_fname)
+                new_file_id = upload_to_drive(p["uploaded_file"], new_standard_fname, UPLOAD_FOLDER_ID)
                 
                 new_rec = {
                     "Tarih / Saat": now_str,
@@ -574,16 +594,17 @@ else:
                     "Doküman Adı": p["doc_title"],
                     "Revizyon No": p["doc_rev"],
                     "Açıklama / Not": p["doc_note"],
-                    "Dosya Adı": new_file_name,
+                    "Dosya Adı": new_standard_fname,
                     "Ekleyen": st.session_state["username"],
-                    "Revizyon Mu": "Evet"
+                    "Revizyon Mu": "Evet",
+                    "Drive_File_ID": new_file_id
                 }
                 df_docs = pd.concat([pd.DataFrame([new_rec]), df_docs], ignore_index=True)
                 save_data(df_docs, "Departman_Dokumanlari")
                 
                 add_notification(st.session_state["username"], dept_name, f"REVİZYON YAPILDI: {p['doc_no']} - {p['doc_title']} (Rev: {p['doc_rev']})")
                 del st.session_state["pending_rev"]
-                st.success(f"✅ Revizyon başarıyla işlendi! Yeni dosya **{new_file_name}** olarak canlıya alındı, eski versiyon arşive kaldırıldı.")
+                st.success(f"✅ Revizyon başarıyla işlendi! Yeni dosya **{new_standard_fname}** olarak Google Drive'a yüklendi, eski versiyon arşive kaldırıldı.")
                 st.rerun()
 
             if col_rev2.button("📄 EVET, Farklı Bir Doküman Olarak Ekle"):
@@ -591,7 +612,7 @@ else:
                 
                 _, ext = os.path.splitext(p["uploaded_file"].name)
                 new_standard_fname = generate_standard_filename(p["doc_no"], p["doc_title"], p["doc_rev"], ext)
-                new_file_name = save_uploaded_file_standard(p["uploaded_file"], UPLOAD_DIR, new_standard_fname)
+                new_file_id = upload_to_drive(p["uploaded_file"], new_standard_fname, UPLOAD_FOLDER_ID)
                 
                 new_rec = {
                     "Tarih / Saat": now_str,
@@ -600,9 +621,10 @@ else:
                     "Doküman Adı": p["doc_title"],
                     "Revizyon No": p["doc_rev"],
                     "Açıklama / Not": p["doc_note"],
-                    "Dosya Adı": new_file_name,
+                    "Dosya Adı": new_standard_fname,
                     "Ekleyen": st.session_state["username"],
-                    "Revizyon Mu": "Hayır"
+                    "Revizyon Mu": "Hayır",
+                    "Drive_File_ID": new_file_id
                 }
                 
                 df_docs = pd.concat([pd.DataFrame([new_rec]), df_docs], ignore_index=True)
@@ -610,7 +632,7 @@ else:
                 
                 add_notification(st.session_state["username"], dept_name, f"Yeni Doküman Eklendi: {p['doc_no']} - {p['doc_title']} (Rev: {p['doc_rev']})")
                 del st.session_state["pending_rev"]
-                st.success(f"✅ Doküman başarıyla eklendi! Dosya adı: **{new_file_name}**")
+                st.success(f"✅ Doküman başarıyla eklendi! Dosya adı: **{new_standard_fname}**")
                 st.rerun()
 
             if col_rev3.button("❌ İŞLEMİ İPTAL ET"):
@@ -651,14 +673,16 @@ else:
             st.dataframe(filtered_active, use_container_width=True)
 
             for idx, row in filtered_active.iterrows():
+                file_id = row.get("Drive_File_ID", "")
                 f_name = row.get("Dosya Adı", "Yok")
-                if f_name and f_name != "Yok":
-                    f_path = os.path.join(UPLOAD_DIR, f_name)
-                    if os.path.exists(f_path):
-                        c1, c2 = st.columns([3, 1])
-                        c1.write(f"📄 **[{row.get('Doküman No')}]** {row.get('Doküman Adı')} *(Rev: {row.get('Revizyon No')})*")
-                        with open(f_path, "rb") as f:
-                            c2.download_button(label="📥 İndir", data=f, file_name=f_name, key=f"act_down_{idx}_{f_name}")
+                if file_id and file_id != "None" and file_id != "":
+                    c1, c2 = st.columns([3, 1])
+                    c1.write(f"📄 **[{row.get('Doküman No')}]** {row.get('Doküman Adı')} *(Rev: {row.get('Revizyon No')})*")
+                    try:
+                        file_bytes = download_from_drive(file_id)
+                        c2.download_button(label="📥 İndir", data=file_bytes, file_name=f_name, key=f"act_down_{idx}_{file_id}")
+                    except Exception:
+                        c2.caption("⚠️ İndirilemedi")
         else:
             st.info(f"{dept_name} departmanına ait kayıtlı aktif doküman bulunmuyor.")
 
@@ -688,13 +712,15 @@ else:
             st.dataframe(filtered_arch_dept, use_container_width=True)
 
             for idx, row in filtered_arch_dept.iterrows():
+                file_id = row.get("Drive_File_ID", "")
                 f_name = row.get("Dosya Adı", "Yok")
-                if f_name and f_name != "Yok":
-                    f_path = os.path.join(ARCHIVE_DIR, f_name)
-                    if os.path.exists(f_path):
-                        c1, c2 = st.columns([3, 1])
-                        c1.write(f"📁 **[{row.get('Doküman No')}]** {row.get('Doküman Adı')} *(Eski Rev: {row.get('Revizyon No')})* - Arşiv Tarihi: {row.get('Arşivlenme Tarihi')}")
-                        with open(f_path, "rb") as f:
-                            c2.download_button(label="📥 Eski Versiyonu İndir", data=f, file_name=f_name, key=f"arch_down_{idx}_{f_name}")
+                if file_id and file_id != "None" and file_id != "":
+                    c1, c2 = st.columns([3, 1])
+                    c1.write(f"📁 **[{row.get('Doküman No')}]** {row.get('Doküman Adı')} *(Eski Rev: {row.get('Revizyon No')})* - Arşiv Tarihi: {row.get('Arşivlenme Tarihi')}")
+                    try:
+                        file_bytes = download_from_drive(file_id)
+                        c2.download_button(label="📥 Eski Versiyonu İndir", data=file_bytes, file_name=f_name, key=f"arch_down_{idx}_{file_id}")
+                    except Exception:
+                        c2.caption("⚠️ İndirilemedi")
         else:
             st.info(f"{dept_name} departmanına ait arşivlenmiş eski doküman bulunmuyor.")
