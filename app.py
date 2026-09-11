@@ -66,35 +66,32 @@ def get_worksheet_by_name(sheet_name):
         return ws
 
 def load_data(sheet_name):
+    expected_columns_map = {
+        "Departman_Dokumanlari": ["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Drive Linki", "Ekleyen", "Revizyon Mu"],
+        "Arsiv_Dokumanlari": ["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Drive Linki", "Ekleyen", "Arşivlenme Tarihi"],
+        "kullanicilar": ["KullaniciAdi", "Sifre", "AdSoyad", "Rol", "Departman", "Durum", "Yetki"],
+        "Bildirimler": ["Tarih / Saat", "İşlemi Yapan", "Departman / Modül", "Detay / Doküman"]
+    }
+    
+    default_cols = expected_columns_map.get(sheet_name, ["Tarih / Saat", "İşlemi Yapan", "Departman / Modül", "Detay / Doküman"])
+
     try:
         ws = get_worksheet_by_name(sheet_name)
         records = ws.get_all_records()
         df = pd.DataFrame(records)
         
+        # Eğer veri tabanı boşsa veya DataFrame sütunsuz geldiyse zorunlu sütunları tanımla
         if df.empty:
-            if sheet_name == "Departman_Dokumanlari":
-                return pd.DataFrame(columns=["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Drive Linki", "Ekleyen", "Revizyon Mu"])
-            elif sheet_name == "Arsiv_Dokumanlari":
-                return pd.DataFrame(columns=["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Drive Linki", "Ekleyen", "Arşivlenme Tarihi"])
-            elif sheet_name == "kullanicilar":
-                return pd.DataFrame(columns=["KullaniciAdi", "Sifre", "AdSoyad", "Rol", "Departman", "Durum", "Yetki"])
-            else:
-                return pd.DataFrame(columns=["Tarih / Saat", "İşlemi Yapan", "Departman / Modül", "Detay / Doküman"])
+            return pd.DataFrame(columns=default_cols)
 
-        if sheet_name == "Departman_Dokumanlari":
-            expected_cols = ["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Drive Linki", "Ekleyen", "Revizyon Mu"]
-            for col in expected_cols:
-                if col not in df.columns:
-                    df[col] = "Hayır" if col == "Revizyon Mu" else ("-" if col == "Drive Linki" else ("00" if col == "Revizyon No" else "-"))
-        elif sheet_name == "Arsiv_Dokumanlari":
-            expected_cols = ["Tarih / Saat", "Departman", "Doküman No", "Doküman Adı", "Revizyon No", "Açıklama / Not", "Dosya Adı", "Drive Linki", "Ekleyen", "Arşivlenme Tarihi"]
-            for col in expected_cols:
-                if col not in df.columns:
-                    df[col] = "-"
+        # Eksik sütunları kontrol et ve eksik olanları varsayılan değerle tamamla
+        for col in default_cols:
+            if col not in df.columns:
+                df[col] = "-"
         return df
     except Exception as e:
         st.error(f"Google Sheets okuma hatası ({sheet_name}): {e}")
-        return pd.DataFrame()
+        return pd.DataFrame(columns=default_cols)
 
 def save_data(df_new, sheet_name):
     try:
@@ -194,8 +191,8 @@ def add_notification(user, modul, detail):
 # --- CANLI KULLANICI DOĞRULAMA KONTROLÜ ---
 def authenticate_user_live(username_input, password_input):
     df_users = load_data("kullanicilar")
-    if df_users.empty:
-        return False, "Kullanıcı veritabanına ulaşılamadı.", None
+    if df_users.empty or "KullaniciAdi" not in df_users.columns:
+        return False, "Kullanıcı veritabanına ulaşılamadı veya tablo biçimi hatalı.", None
 
     user_row = df_users[df_users["KullaniciAdi"].astype(str).str.strip() == str(username_input).strip()]
     if user_row.empty:
@@ -324,7 +321,7 @@ if modul == "🔍 GENEL ARAMA MERKEZİ":
     tab_g1, tab_g2 = st.tabs(["📄 Aktif Dokümanlar İçinde Ara", "📁 Arşiv Dokümanları İçinde Ara"])
     
     with tab_g1:
-        if not df_docs.empty:
+        if not df_docs.empty and "Doküman Adı" in df_docs.columns:
             if search_query:
                 filtered_df = df_docs[
                     df_docs["Doküman Adı"].astype(str).str.lower().str.contains(search_query) |
@@ -356,7 +353,7 @@ if modul == "🔍 GENEL ARAMA MERKEZİ":
             st.info("Sistemde henüz aktif doküman bulunmuyor.")
 
     with tab_g2:
-        if not df_archive.empty:
+        if not df_archive.empty and "Doküman Adı" in df_archive.columns:
             if search_query:
                 filtered_arch = df_archive[
                     df_archive["Doküman Adı"].astype(str).str.lower().str.contains(search_query) |
@@ -468,7 +465,7 @@ else:
                 if not doc_no or not doc_title or uploaded_file is None:
                     st.error("Lütfen Doküman Numarası, Doküman Adı giriniz ve bir dosya seçiniz.")
                 else:
-                    existing = df_docs[(df_docs["Departman"] == dept_name) & (df_docs["Doküman No"] == doc_no)]
+                    existing = df_docs[(df_docs["Departman"] == dept_name) & (df_docs["Doküman No"] == doc_no)] if not df_docs.empty else pd.DataFrame()
                     
                     if not existing.empty:
                         old_row = existing.iloc[0]
@@ -626,7 +623,8 @@ else:
                 df_archive = pd.concat([pd.DataFrame([old_archive_rec]), df_archive], ignore_index=True)
                 save_data(df_archive, "Arsiv_Dokumanlari")
                 
-                df_docs = df_docs[~((df_docs["Departman"] == dept_name) & (df_docs["Doküman No"] == p["doc_no"]))]
+                if not df_docs.empty and "Departman" in df_docs.columns and "Doküman No" in df_docs.columns:
+                    df_docs = df_docs[~((df_docs["Departman"] == dept_name) & (df_docs["Doküman No"] == p["doc_no"]))]
                 
                 _, ext = os.path.splitext(p["uploaded_file_name"])
                 new_standard_fname = generate_standard_filename(p["doc_no"], p["doc_title"], p["doc_rev"], ext)
@@ -701,7 +699,10 @@ else:
     st.subheader(f"📋 {dept_name} Mevcut Doküman Listesi")
     dept_search = st.text_input(f"🔍 {dept_name} İçinde Hızlı Dosya Ara (Kod, Ad, Not)...", key=f"search_{dept_name}").strip().lower()
 
-    dept_docs = df_docs[df_docs["Departman"] == dept_name]
+    if not df_docs.empty and "Departman" in df_docs.columns:
+        dept_docs = df_docs[df_docs["Departman"] == dept_name]
+    else:
+        dept_docs = pd.DataFrame()
 
     if not dept_docs.empty:
         if dept_search:
